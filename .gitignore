@@ -1,0 +1,11 @@
+# 设备二进制文件（不应上传到公开仓库）
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
