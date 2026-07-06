@@ -12,7 +12,7 @@
 
 联发科的 preloader 在启动时加载 GenieZone 到 EL2。直接删除 gz 分区会导致 preloader 内部的分区查找函数 `func_36d68` 返回错误，触发 "Second Bootloader Load Failed" 致命错误，设备无法启动。
 
-本工具利用 preloader 中 **分区存在性检查** 与 **数据读取** 使用不同函数的特性：保留 gz1/gz2 分区条目在 GPT 中（通过存在性检查），但将 LBA 地址指向存储设备容量之外（使数据读取失败），从而触发 preloader 内部的 `NoGZ` 标志位，安全跳过 GenieZone 的加载。
+本工具利用 preloader 中 **分区存在性检查** 与 **数据读取** 使用不同函数的特性：保留 gz1/gz2 分区条目在 GPT 中（通过存在性检查），但将 LBA 地址指向存储设备容量之外（使数据读取失败），从而触发 preloader 内部的 EL2_BOOTING_DISABLED `NoGZ` 标志位，安全跳过 GenieZone 的加载。
 
 ## 使用方法
 
