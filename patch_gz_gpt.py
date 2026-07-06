@@ -169,7 +169,7 @@ def find_gz_partitions(parts):
         if p is None:
             continue
         name_lower = p['name'].lower()
-        if name_lower in ('gz1', 'gz2', 'gz1_a', 'gz1_b', 'gz2_a', 'gz2_b'):
+        if name_lower in ('gz', 'gz1', 'gz2', 'gz_a', 'gz_b', 'gz1_a', 'gz1_b', 'gz2_a', 'gz2_b'):
             gz_parts.append(p)
     return gz_parts
 
@@ -196,8 +196,15 @@ def main():
         if not os.path.isfile(backup_path):
             print(f"错误: 备份文件不存在: {backup_path}")
             sys.exit(1)
-        shutil.copy2(backup_path, args.input)
+        try:
+            shutil.copy2(backup_path, args.input)
+        except OSError as e:
+            print(f"错误: 无法写入文件: {e}")
+            sys.exit(1)
         print(f"已从 {backup_path} 还原到 {args.input}")
+        if output_path != args.input and os.path.isfile(output_path):
+            os.remove(output_path)
+            print(f"已删除修改后的文件: {output_path}")
         sys.exit(0)
 
     with open(args.input, 'rb') as f:
@@ -254,7 +261,7 @@ def main():
     # ── 3. 查找 gz 分区 ──
     gz_parts = find_gz_partitions(parts)
     if not gz_parts:
-        print("\n错误: 未找到 gz 相关分区 (gz1/gz2/gz1_a/gz1_b)")
+        print("\n错误: 未找到 gz 相关分区 (gz/gz1/gz2/gz_a/gz1_a/...)")
         print("此设备可能不使用 GenieZone，或分区命名不同")
         sys.exit(1)
 
@@ -266,7 +273,7 @@ def main():
     # 检查是否已经被修改过
     already_patched = []
     for p in gz_parts:
-        if p['start_lba'] > total_lbas:
+        if p['start_lba'] >= total_lbas:
             already_patched.append(p)
 
     if already_patched:
@@ -327,8 +334,12 @@ def main():
         print("\n错误: CRC 验证失败，未保存文件")
         sys.exit(1)
 
-    with open(output_path, 'wb') as f:
-        f.write(data)
+    try:
+        with open(output_path, 'wb') as f:
+            f.write(data)
+    except OSError as e:
+        print(f"\n错误: 无法写入输出文件: {e}")
+        sys.exit(1)
 
     # 统计差异字节数
     diff_count = sum(1 for a, b in zip(raw, data) if a != b)

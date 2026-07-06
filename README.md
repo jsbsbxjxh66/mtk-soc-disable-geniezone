@@ -191,7 +191,7 @@ func_40974(addr, buf, sz)  ← 实际从存储设备读取数据
 | 已验证平台 | MT6893 (Dimensity 1200) |
 | 理论兼容 | 其他使用 GenieZone 的联发科平台（MT6885/6889/6893/6983/6985 等） |
 | 扇区大小 | 自动检测 512 字节 (eMMC) 和 4096 字节 (UFS) |
-| 分区名称 | 支持 gz1/gz2/gz1_a/gz1_b/gz2_a/gz2_b |
+| 分区名称 | 支持 gz/gz1/gz2/gz_a/gz_b/gz1_a/gz1_b/gz2_a/gz2_b |
 
 ## 致谢
 
