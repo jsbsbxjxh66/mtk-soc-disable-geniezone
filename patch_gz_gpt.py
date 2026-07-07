@@ -2,19 +2,13 @@
 """
 patch_gz_gpt.py - Disable MediaTek GenieZone by patching GPT partition table
 
-Keeps gz1/gz2 partition entries in GPT (passes preloader's get_part_info check)
-but points their LBAs beyond device capacity, causing storage reads to fail
-and triggering the internal NoGZ flag. No preloader signature is broken.
-
-通过修改 GPT 分区表中 gz 分区的 LBA 地址来禁用 GenieZone。
-保留分区条目（通过存在性检查），但将 LBA 指向设备容量之外，
-使存储读取失败，触发 NoGZ 标志。不破坏 preloader 签名。
+将 gz 分区 LBA 指向设备容量+1（越界 1 扇区），使 preloader 的
+func_40974 I/O 失败返回 -1，触发 NoGZ 标志，跳过 GZ 加载。
 
 Usage:
-  python3 patch_gz_gpt.py <pgpt.bin>                 # patch → pgpt_patched.bin
-  python3 patch_gz_gpt.py <pgpt.bin> -o <output.bin>  # custom output path
-  python3 patch_gz_gpt.py <pgpt.bin> --dry-run        # analyze only
-  python3 patch_gz_gpt.py <pgpt.bin> --restore        # restore from backup
+  python3 patch_gz_gpt.py <pgpt.bin>                # 修改 gz 分区 LBA
+  python3 patch_gz_gpt.py <pgpt.bin> --dry-run      # 仅分析不修改
+  python3 patch_gz_gpt.py <pgpt.bin> --restore      # 从备份还原
 """
 
 import struct
@@ -26,7 +20,6 @@ import os
 
 
 def find_gpt_header(data):
-    """在文件中搜索 'EFI PART' 签名，自动检测扇区大小和 GPT 头偏移。"""
     sig = b'EFI PART'
     candidates = []
     off = 0
@@ -59,7 +52,6 @@ def find_gpt_header(data):
             if stored_crc == calc_crc:
                 return pos, sector_size
 
-    # 回退：使用第一个候选位置推断
     pos = candidates[0]
     my_lba = struct.unpack_from('<Q', data, pos + 24)[0]
     if my_lba > 0:
@@ -72,7 +64,6 @@ def find_gpt_header(data):
 
 
 def parse_gpt_header(data, hdr_off):
-    """解析 GPT 头，返回字段字典。"""
     fields = {}
     fields['signature'] = data[hdr_off:hdr_off + 8]
     fields['revision'] = struct.unpack_from('<I', data, hdr_off + 8)[0]
@@ -91,7 +82,6 @@ def parse_gpt_header(data, hdr_off):
 
 
 def parse_partitions(data, entries_off, num_entries, entry_size):
-    """解析所有分区条目。"""
     parts = []
     for i in range(num_entries):
         off = entries_off + i * entry_size
@@ -118,6 +108,7 @@ def parse_partitions(data, entries_off, num_entries, entry_size):
             'end_lba': end_lba,
             'attributes': attributes,
             'name': name,
+            'name_raw': name_raw,
         })
     return parts
 
@@ -133,7 +124,6 @@ def format_size(size_bytes):
 
 
 def update_crcs(data, hdr_off, entries_off, num_entries, entry_size):
-    """重新计算并写入 entries CRC32 和 header CRC32。"""
     entries_blob = bytes(data[entries_off:entries_off + num_entries * entry_size])
     new_ecrc = binascii.crc32(entries_blob) & 0xFFFFFFFF
     struct.pack_into('<I', data, hdr_off + 88, new_ecrc)
@@ -148,7 +138,6 @@ def update_crcs(data, hdr_off, entries_off, num_entries, entry_size):
 
 
 def verify_crcs(data, hdr_off, entries_off, num_entries, entry_size):
-    """验证 CRC32 校验。"""
     header_size = struct.unpack_from('<I', data, hdr_off + 12)[0]
     stored_hcrc = struct.unpack_from('<I', data, hdr_off + 16)[0]
     hdr_copy = bytearray(data[hdr_off:hdr_off + header_size])
@@ -163,7 +152,6 @@ def verify_crcs(data, hdr_off, entries_off, num_entries, entry_size):
 
 
 def find_gz_partitions(parts):
-    """查找所有 gz 相关分区（gz1, gz2, gz1_a, gz1_b 等）。"""
     gz_parts = []
     for p in parts:
         if p is None:
@@ -174,13 +162,35 @@ def find_gz_partitions(parts):
     return gz_parts
 
 
+def apply_patch(data, gz_parts, total_lbas):
+    invalid_base = total_lbas
+    print(f"\n  无效 LBA: {invalid_base:#x} (最后有效 LBA: {total_lbas - 1:#x})")
+    print(f"  紧贴设备末尾")
+    print(f"  原理: func_40974 读取越界 LBA → 返回 -1 → NoGZ")
+
+    for i, p in enumerate(gz_parts):
+        new_start = invalid_base + i * 2
+        new_end = new_start
+
+        print(f"\n  {p['name']}:")
+        print(f"    Start LBA: {p['start_lba']:#x} → {new_start:#x}")
+        print(f"    End LBA:   {p['end_lba']:#x} → {new_end:#x}")
+
+        struct.pack_into('<Q', data, p['offset'] + 32, new_start)
+        struct.pack_into('<Q', data, p['offset'] + 40, new_end)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='修改 GPT 分区表中 gz 分区的 LBA 地址以禁用 GenieZone')
-    parser.add_argument('input', help='输入的 GPT 分区表文件 (pgpt.bin)')
-    parser.add_argument('-o', '--output', help='输出文件路径 (默认: <input>_patched.bin)')
+        description='修改 GPT 分区表以禁用 GenieZone',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+将 gz 分区 LBA 指向紧贴设备末尾的无效地址，触发 I/O 失败 → NoGZ。
+""")
+    parser.add_argument('input', help='GPT 分区表文件 (pgpt.bin)')
+    parser.add_argument('-o', '--output', help='输出文件路径')
     parser.add_argument('--dry-run', action='store_true', help='仅分析不修改')
-    parser.add_argument('--restore', action='store_true', help='从备份还原原始文件')
+    parser.add_argument('--restore', action='store_true', help='从备份还原')
     args = parser.parse_args()
 
     if not os.path.isfile(args.input):
@@ -191,16 +201,11 @@ def main():
     backup_path = base + '_backup' + ext
     output_path = args.output or (base + '_patched' + ext)
 
-    # 还原模式
     if args.restore:
         if not os.path.isfile(backup_path):
             print(f"错误: 备份文件不存在: {backup_path}")
             sys.exit(1)
-        try:
-            shutil.copy2(backup_path, args.input)
-        except OSError as e:
-            print(f"错误: 无法写入文件: {e}")
-            sys.exit(1)
+        shutil.copy2(backup_path, args.input)
         print(f"已从 {backup_path} 还原到 {args.input}")
         if output_path != args.input and os.path.isfile(output_path):
             os.remove(output_path)
@@ -231,14 +236,12 @@ def main():
     print(f"设备容量: {total_lbas} LBA = {format_size(device_bytes)}")
     print(f"分区条目: {num_entries} 个 × {entry_size} 字节, 起始 offset {entries_off:#x}")
 
-    # 验证文件中包含足够的条目数据
     needed = entries_off + num_entries * entry_size
     if needed > len(raw):
         actual = (len(raw) - entries_off) // entry_size
         print(f"警告: 文件仅包含 {actual}/{num_entries} 个分区条目")
         num_entries = actual
 
-    # 验证 CRC
     hdr_ok, ent_ok = verify_crcs(raw, hdr_off, entries_off, num_entries, entry_size)
     print(f"CRC 校验: Header={'通过' if hdr_ok else '失败!'}, Entries={'通过' if ent_ok else '失败!'}")
     if not hdr_ok or not ent_ok:
@@ -268,67 +271,31 @@ def main():
     print(f"\n找到 {len(gz_parts)} 个 GZ 分区:")
     for p in gz_parts:
         sectors = p['end_lba'] - p['start_lba'] + 1
-        print(f"  {p['name']}: LBA {p['start_lba']:#x} - {p['end_lba']:#x} ({sectors} 扇区, {format_size(sectors * sector_size)})")
-
-    # 检查是否已经被修改过
-    already_patched = []
-    for p in gz_parts:
-        if p['start_lba'] >= total_lbas:
-            already_patched.append(p)
-
-    if already_patched:
-        print(f"\n注意: 以下分区的 LBA 已超出设备容量，可能已经被修改过:")
-        for p in already_patched:
-            print(f"  {p['name']}: Start LBA {p['start_lba']:#x} > 设备容量 {total_lbas:#x}")
-        if len(already_patched) == len(gz_parts):
-            print("\n所有 gz 分区已经是无效 LBA 状态，无需再次修改")
-            sys.exit(0)
+        print(f"  {p['name']}: LBA {p['start_lba']:#x} - {p['end_lba']:#x} "
+              f"({sectors} 扇区, {format_size(sectors * sector_size)})")
 
     if args.dry_run:
-        print("\n[DRY RUN] 以上为分析结果，未进行任何修改")
+        print(f"\n[DRY RUN] 以上为分析结果，未进行任何修改")
         sys.exit(0)
 
-    # ── 4. 执行修改 ──
-    # 计算无效 LBA: 设备总 LBA 向上对齐到 2^N，确保远超设备容量且在 32 位范围内
-    invalid_base = 1
-    while invalid_base <= total_lbas:
-        invalid_base <<= 1
-    # 确保不超过 32 位 (preloader 内部结构使用 uint32)
-    if invalid_base > 0x7FFFFFFE:
-        invalid_base = 0x7FFFFFFE
-
-    print(f"\n无效 LBA 基址: {invalid_base:#x} (设备容量: {total_lbas:#x})")
-
-    # 备份原文件
+    # ── 4. 备份 ──
     if not os.path.isfile(backup_path):
         shutil.copy2(args.input, backup_path)
         print(f"已备份原始文件到: {backup_path}")
 
     data = bytearray(raw)
 
+    # ── 5. 应用修改 ──
     print(f"\n修改详情:")
-    for i, p in enumerate(gz_parts):
-        new_start = invalid_base + i * 4
-        new_end = new_start + 1  # 2 扇区，通过 preloader 的 range check
+    apply_patch(data, gz_parts, total_lbas)
 
-        old_start = p['start_lba']
-        old_end = p['end_lba']
-
-        struct.pack_into('<Q', data, p['offset'] + 32, new_start)
-        struct.pack_into('<Q', data, p['offset'] + 40, new_end)
-
-        print(f"  {p['name']}:")
-        print(f"    Start LBA: {old_start:#x} → {new_start:#x}")
-        print(f"    End LBA:   {old_end:#x} → {new_end:#x}")
-        print(f"    扇区数:    {old_end - old_start + 1} → {new_end - new_start + 1}")
-
-    # ── 5. 更新 CRC ──
+    # ── 6. 更新 CRC ──
     new_ecrc, new_hcrc = update_crcs(data, hdr_off, entries_off, num_entries, entry_size)
     print(f"\nCRC 更新:")
     print(f"  Entries CRC32: {hdr['entries_crc32']:#010x} → {new_ecrc:#010x}")
     print(f"  Header CRC32:  {hdr['header_crc32']:#010x} → {new_hcrc:#010x}")
 
-    # ── 6. 验证并保存 ──
+    # ── 7. 验证并保存 ──
     hdr_ok, ent_ok = verify_crcs(data, hdr_off, entries_off, num_entries, entry_size)
     if not hdr_ok or not ent_ok:
         print("\n错误: CRC 验证失败，未保存文件")
@@ -341,7 +308,6 @@ def main():
         print(f"\n错误: 无法写入输出文件: {e}")
         sys.exit(1)
 
-    # 统计差异字节数
     diff_count = sum(1 for a, b in zip(raw, data) if a != b)
 
     print(f"\n{'═' * 50}")
