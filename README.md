@@ -1,6 +1,6 @@
 # mtk-soc-disable-geniezone
 
-禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。LK 方案支持旧式 `gz_unmap_check`（如 MT6833/MT6895）和新式 bl2_ext GZ 初始化管线（如 MT6991）。
+禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。LK 方案支持旧式 `gz_unmap_check`（如 MT6895）和新式 bl2_ext GZ 初始化管线（如 MT6991）。
 
 > **免责声明**
 >
@@ -23,7 +23,7 @@
 | **LK 新式方案** | LK (bl2_ext 段) | bl2_ext 中存在 GZ 初始化管线 | 是 |
 
 - GPT 方案通过让 preloader 的 GZ 分区 I/O 失败来触发 NoGZ，不修改任何代码
-- LK 旧式方案（MT6833/MT6895 等）— GZ 逻辑在 lk 段：
+- LK 旧式方案（MT6895 等）— GZ 逻辑在 lk 段：
   - **方案 A** (`--patch`)：补丁 `gz_unmap_check` 函数，强制始终返回 1（释放 GZ 内存）
   - **方案 B** (`--patch-default`)：修改 `gz_enabled` 全局变量默认值 1→0（GZ 默认禁用）
 - LK 新式方案（MT6991 等）— GZ 逻辑在 bl2_ext 段，使用 Hafnium S-EL2 + GenieZone 架构：
@@ -317,7 +317,7 @@ python3 patch_gz_gpt.py pgpt.bin --restore
 
 分析 LK (Little Kernel) 固件，检测 GZ 内存释放逻辑并提供补丁。自动识别两种 GZ 实现方式：
 
-- **旧式**（MT6833/MT6895 等）：GZ 逻辑在 lk 段，通过 `gz_unmap_check` + `gz_enabled` 全局变量控制
+- **旧式**（MT6895 等）：GZ 逻辑在 lk 段，通过 `gz_unmap_check` + `gz_enabled` 全局变量控制
 - **新式**（MT6991 等）：GZ 逻辑在 bl2_ext 段，通过 `gz_config_validate` → `gz_init_main` 管线控制，使用 Hafnium S-EL2 + GenieZone 架构
 
 ### 检测流程
@@ -353,7 +353,7 @@ python3 detect_lk_gz.py lk.img --patch-init-fail
 python3 detect_lk_gz.py lk.img --restore
 ```
 
-### 旧式 gz_unmap_check（MT6833/MT6895 等）
+### 旧式 gz_unmap_check（MT6895 等）
 
 #### 支持的函数模式
 
@@ -531,7 +531,7 @@ cleanup_path:                  cleanup_path:
 
 ### 启动流程中的 GenieZone
 
-**旧式架构（MT6833/MT6895 等）：**
+**旧式架构（MT6895 等）：**
 
 ```
 BROM → preloader (签名验证) → ATF → LK → kernel
@@ -650,10 +650,10 @@ LK 方案修改了 LK 代码/数据，签名校验不通过。需要使用不校
 
 | 设备 | SoC | 系统 | 架构 | GPT 方案 | LK 方案 |
 |------|-----|------|------|---------|---------|
-| OPPO A55 | MT6833 | Android 13 | Thumb PIC | **可用** | 旧式 |
-| OPPO K9 Pro | MT6893 | Android 13 | Thumb PIC | **可用** | 旧式 |
-| Realme GT Neo 闪速版 | MT6893 | Android 13 | Thumb PIC | **可用** | 旧式 |
-| — | MT6895 | — | AArch64 | 不可用 | 旧式 |
+| OPPO A55 | MT6833 | Android 13 | Thumb PIC | **可用** | 不适用（LK 无 GZ 代码） |
+| OPPO K9 Pro | MT6893 | Android 13 | Thumb PIC | **可用** | 不适用（LK 无 GZ 代码） |
+| Realme GT Neo 闪速版 | MT6893 | Android 13 | Thumb PIC | **可用** | 不适用（LK 无 GZ 代码） |
+| — | MT6895 | — | AArch64 | 部分可用 | 旧式 |
 | — | MT6991 | — | AArch64 | **不可用** | 新式 (bl2_ext) |
 
 ### 其他
@@ -674,7 +674,7 @@ LK 方案修改了 LK 代码/数据，签名校验不通过。需要使用不校
 - **备份 GPT**：`patch_gz_gpt.py` 仅修改主 GPT，设备末尾的备份 GPT 可能需要同步修改
 - **LK 签名**：LK 方案修改了代码/数据，需要不校验签名的 preloader 或 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名
 - **处理器代际差异**：
-  - 天玑 v5 及以下（如 MT6833/MT6893）：GPT 方案通常直接可用
+  - 天玑 v5 及以下（如 MT6833/MT6893）：GPT 方案通常直接可用，LK 无 GZ 代码不需要 LK 方案
   - 天玑 v6（如 MT6895）：可能需要 GPT + 旧式 LK 方案（`--patch` / `--patch-default`）
   - 天玑 v7+（如 MT6991）：GPT 方案不可用（preloader 不加载 GZ，GZ 由 bl2_ext 负责），需使用新式 LK 方案（`--patch-validate` / `--patch-init-fail`）
   - 或使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 高级用法直接干掉 GenieZone
