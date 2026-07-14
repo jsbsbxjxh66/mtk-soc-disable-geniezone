@@ -531,7 +531,20 @@ cleanup_path:                  cleanup_path:
 
 ### 启动流程中的 GenieZone
 
-**旧式架构（MT6895 等）：**
+**旧式架构（MT6833/MT6893 等，LK 无 GZ 代码）：**
+
+```
+BROM → preloader (签名验证) → ATF → LK → kernel
+              │                          │
+              ├─ gz_init(): 读取 gz 分区  ├─ LK 无 gz_unmap_check
+              │   失败 → 设置 NoGZ 标志   │   无 GZ 功能代码, 仅有分区名/DTB 节点
+              ├─ 分区加载循环: 加载        │   GZ 禁用完全由 preloader 阶段决定
+              │   tee/gz/scp 等分区镜像    └─ DTB: trusty-gz / nebula 节点 → kernel
+              └─ ATF 跳转: 根据 NoGZ
+                  决定是否将 EL2 移交给 GZ
+```
+
+**旧式架构（MT6895 等，LK 含 GZ 代码）：**
 
 ```
 BROM → preloader (签名验证) → ATF → LK → kernel
@@ -558,7 +571,8 @@ BROM → preloader (签名验证) → ATF → LK (bl2_ext) → LK (lk) → kerne
                                          └─ DTB: nebula / trusty-gz 节点 → kernel
 ```
 
-- **GPT 方案**作用于 preloader 阶段：让 gz 分区 I/O 失败 → NoGZ → 跳过 GZ 加载
+- **GPT 方案**（MT6833/MT6893 等）：作用于 preloader 阶段，让 gz 分区 I/O 失败 → NoGZ → 跳过 GZ 加载。LK 无 GZ 代码，GPT 方案即可完全禁用
+- **GPT + LK 方案**（MT6895 等）：GPT 方案触发 NoGZ，但 LK 中 `gz_enabled` 默认为 1 仍保留内存，需配合 LK 方案释放
 - **旧式 LK 方案 A**：补丁 gz_unmap_check → 强制返回 1 → 释放 GZ 保留内存
 - **旧式 LK 方案 B**：修改 gz_enabled 默认值 1→0 → 无 boot tag 时 GZ 默认禁用
 - **新式 LK 方案 A**：补丁 gz_config_validate → 返回 0 → 跳过 bl2_ext 中的 GZ 初始化
