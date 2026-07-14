@@ -690,7 +690,7 @@ LK 方案修改了 LK 代码/数据，签名校验不通过。需要使用不校
 - **处理器代际差异**：
   - 天玑 v5 及以下（如 MT6833/MT6893）：GPT 方案通常直接可用，LK 无 GZ 代码不需要 LK 方案
   - 天玑 v6（如 MT6895）：可能需要 GPT + 旧式 LK 方案（`--patch` / `--patch-default`）
-  - 天玑 v7+（如 MT6991）：GPT 方案不可用（preloader 不加载 GZ，GZ 由 bl2_ext 负责），需使用新式 LK 方案（`--patch-validate` / `--patch-init-fail`）
+  - 天玑 v6+（如 MT6991）：GPT 方案不可用（preloader 不加载 GZ，GZ 由 bl2_ext 负责），需使用新式 LK 方案（`--patch-validate` / `--patch-init-fail`）
   - 或使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 高级用法直接干掉 GenieZone
 - **功能影响**：禁用 GenieZone 后，依赖 GZ 虚拟化服务的功能（如部分 DRM、安全容器等）可能不可用
 
