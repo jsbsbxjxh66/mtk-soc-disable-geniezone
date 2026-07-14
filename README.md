@@ -32,7 +32,7 @@
 - 脚本自动检测 LK 类型（旧式/新式），显示对应的可用方案
 - 部分平台 GPT 方案不可用（如 MT6895 的 `halt_on_assert` 被强制置 1），此时需要 LK 方案
 - 使用 GPT 方案时也可能需要配合 LK 旧式方案：因 `gz_enabled` 编译时默认为 1，若 preloader 未发送 GZ boot tag，LK 仍认为 GZ 已启用，不释放保留内存
-- MT6991 等新式平台 GPT 方案不可用：preloader 不再负责加载 GZ（无 `bldr_load_gz_part`），GZ 加载完全由 bl2_ext 执行；修改 GPT 后 preloader 可能因分区表异常拒绝启动。需使用新式 LK 方案
+- MT6991 等新式平台 GPT 方案不可用：preloader 不再负责加载 GZ，GZ 加载由 bl2_ext 执行。修改 GPT 后设备能进 fastboot，但无法正常启动——bl2_ext 的 `gz_init_main` 会在分区加载失败前执行不可逆的硬件配置（内存重映射、mblock 分配等），cleanup 无法完全逆转这些变更。需使用新式 LK 方案
 
 ## 快速开始
 
@@ -635,6 +635,26 @@ Preloader 阶段成功，但 LK 或 kernel 阶段失败。可能原因：
 
 2. **当前版本preloader不适用** — halt_on_assert 被无条件置 1, assert_fatal 触发 WDT reset。尝试 LK 方案
 
+**能进 fastboot 但无法正常启动（MT6991 等新式平台）**
+
+GPT CRC 校验正确，preloader 和 LK 正常运行（因此 fastboot 可用），但正常启动失败。根本原因：bl2_ext 中 `gz_init_main` 在分区加载失败前已执行了不可逆的硬件配置：
+
+```
+gz_init_main 执行流程（GPT 方案下）:
+  ① BL gz_config_env_get ×3     ✅ 已执行 — 配置环境初始化
+  ② BL gz_remap_init             ⚠️ 可能执行 — 内存重映射/安全区域配置
+  ③ BL gz_mblock_create          ✅ 已执行 — 分配 4 个 mblock 内存区域
+  ④ BL gz_part_load_image        ❌ 失败 — UFS 读取无效 LBA
+  ⑤ cleanup: gz_mblock_free_all  ✅ 已执行 — 释放 mblock
+
+  问题: ②的内存重映射/安全配置变更不被 cleanup 逆转
+        → 内核启动时内存布局异常 → 启动失败
+```
+
+LK 补丁方案不存在此问题：
+- **方案 A** (`--patch-validate`)：`gz_init_main` 完全不执行，①~⑤ 均跳过
+- **方案 B** (`--patch-init-fail`)：第一条指令直接跳到 cleanup，①~④ 均跳过
+
 **完全无响应（黑砖）**
 
 UFS 控制器在 preloader 阶段读取越界 LBA 时崩溃（控制器 bug）。需要通过 mtkclient 或 SP Flash Tool 底层恢复刷回备份 GPT。
@@ -690,7 +710,7 @@ LK 方案修改了 LK 代码/数据，签名校验不通过。需要使用不校
 - **处理器代际差异**：
   - 天玑 v5 及以下（如 MT6833/MT6893）：GPT 方案通常直接可用，LK 无 GZ 代码不需要 LK 方案
   - 天玑 v6（如 MT6895）：可能需要 GPT + 旧式 LK 方案（`--patch` / `--patch-default`）
-  - 天玑 v6+（如 MT6991）：GPT 方案不可用（preloader 不加载 GZ，GZ 由 bl2_ext 负责），需使用新式 LK 方案（`--patch-validate` / `--patch-init-fail`）
+  - 天玑 v6+（如 MT6991）：GPT 方案不可用（修改 GPT 后能进 fastboot 但无法正常启动，bl2_ext 中 GZ 初始化的部分执行导致不可逆硬件配置变更），需使用新式 LK 方案（`--patch-validate` / `--patch-init-fail`）
   - 或使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 高级用法直接干掉 GenieZone
 - **功能影响**：禁用 GenieZone 后，依赖 GZ 虚拟化服务的功能（如部分 DRM、安全容器等）可能不可用
 
