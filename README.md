@@ -1,6 +1,6 @@
 # mtk-soc-disable-geniezone
 
-禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。
+禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。LK 方案支持旧式 `gz_unmap_check`（如 MT6833/MT6895）和新式 bl2_ext GZ 初始化管线（如 MT6991）。
 
 > **免责声明**
 >
@@ -12,21 +12,27 @@
 |------|------|
 | `detect_gz_bypass.py` | 分析 preloader 固件，检测 GPT 修改方案是否可用 |
 | `patch_gz_gpt.py` | 修改 GPT 分区表，将 gz 分区 LBA 指向无效地址 |
-| `detect_lk_gz.py` | 分析 LK 固件，检测并修补 GZ 内存释放逻辑 |
+| `detect_lk_gz.py` | 分析 LK 固件，检测并修补 GZ 内存释放逻辑（旧式 gz_unmap + 新式 bl2_ext 管线） |
 
 ## 两种方案
 
 | 方案 | 层面 | 条件 | 是否需要跳过签名 |
 |------|------|------|-----------------|
 | **GPT 方案** | Preloader | `halt_on_assert` 未被强制置 1 | 否 |
-| **LK 方案** | LK | LK 中存在 `gz_unmap` 检查函数 | 是（需要可跳过签名验证的工具） |
+| **LK 旧式方案** | LK (lk 段) | LK 中存在 `gz_unmap` 检查函数 | 是 |
+| **LK 新式方案** | LK (bl2_ext 段) | bl2_ext 中存在 GZ 初始化管线 | 是 |
 
 - GPT 方案通过让 preloader 的 GZ 分区 I/O 失败来触发 NoGZ，不修改任何代码
-- LK 方案提供两种补丁方式（可单独或同时使用）：
-  - **方案 A**：补丁 `gz_unmap_check` 函数，强制始终返回 1（释放 GZ 内存）
-  - **方案 B**：修改 `gz_enabled` 全局变量默认值 1→0（GZ 默认禁用）
+- LK 旧式方案（MT6833/MT6895 等）— GZ 逻辑在 lk 段：
+  - **方案 A** (`--patch`)：补丁 `gz_unmap_check` 函数，强制始终返回 1（释放 GZ 内存）
+  - **方案 B** (`--patch-default`)：修改 `gz_enabled` 全局变量默认值 1→0（GZ 默认禁用）
+- LK 新式方案（MT6991 等）— GZ 逻辑在 bl2_ext 段，使用 Hafnium S-EL2 + GenieZone 架构：
+  - **方案 A** (`--patch-validate`)：补丁 `gz_config_validate` 返回 0，跳过 GZ 初始化
+  - **方案 B** (`--patch-init-fail`)：强制 `gz_init_main` 跳转到错误清理路径，触发 `gz_mblock_free_all` 释放内存
+- 脚本自动检测 LK 类型（旧式/新式），显示对应的可用方案
 - 部分平台 GPT 方案不可用（如 MT6895 的 `halt_on_assert` 被强制置 1），此时需要 LK 方案
-- 使用 GPT 方案时也可能需要配合 LK 方案：因 `gz_enabled` 编译时默认为 1，若 preloader 未发送 GZ boot tag，LK 仍认为 GZ 已启用，不释放保留内存
+- 使用 GPT 方案时也可能需要配合 LK 旧式方案：因 `gz_enabled` 编译时默认为 1，若 preloader 未发送 GZ boot tag，LK 仍认为 GZ 已启用，不释放保留内存
+- MT6991 等新式平台 GPT 方案不可用：preloader 不再负责加载 GZ（无 `bldr_load_gz_part`），GZ 加载完全由 bl2_ext 执行；修改 GPT 后 preloader 可能因分区表异常拒绝启动。需使用新式 LK 方案
 
 ## 快速开始
 
@@ -117,7 +123,9 @@ fastboot flash pgpt pgpt_backup.bin
 python3 detect_lk_gz.py lk.img
 ```
 
-输出示例：
+脚本自动检测 LK 类型并显示可用方案。
+
+输出示例（旧式，如 MT6895）：
 ```
 ============================================================
   gz_unmap 检查函数: 0x01EAA8
@@ -135,7 +143,25 @@ python3 detect_lk_gz.py lk.img
   A+B:    python3 detect_lk_gz.py lk.img --patch --patch-default
 ```
 
+输出示例（新式，如 MT6991）：
+```
+============================================================
+  GZ 类型: 新式初始化管线 (bl2_ext 段)
+  bl2_ext 代码: 0x1B5500  大小: 1.3 MB
+  gz_init_main: 0x1CDED0
+  gz_config_validate: 0x1CDEB4
+  错误清理路径: 0x1CDF48 (含 gz_mblock_free_all)
+
+  方案 A: gz_config_validate → 返回 0 (跳过 GZ 初始化)
+    python3 detect_lk_gz.py lk.img --patch-validate
+  方案 B: gz_init_main → 强制失败 (触发内存释放清理)
+    python3 detect_lk_gz.py lk.img --patch-init-fail
+  A+B:    python3 detect_lk_gz.py lk.img --patch-validate --patch-init-fail
+```
+
 #### 2. 修补 LK
+
+旧式（`--patch` / `--patch-default`）：
 
 ```bash
 # 预览补丁内容（不修改）
@@ -149,9 +175,29 @@ python3 detect_lk_gz.py lk.img --patch-default
 
 # A+B 同时应用
 python3 detect_lk_gz.py lk.img --patch --patch-default
+```
 
+新式（`--patch-validate` / `--patch-init-fail`）：
+
+```bash
+# 预览补丁内容（不修改）
+python3 detect_lk_gz.py lk.img --dry-run
+
+# 方案 A: gz_config_validate 返回 0，跳过 GZ 初始化
+python3 detect_lk_gz.py lk.img --patch-validate
+
+# 方案 B: gz_init_main 强制失败，释放 GZ 内存
+python3 detect_lk_gz.py lk.img --patch-init-fail
+
+# A+B 同时应用
+python3 detect_lk_gz.py lk.img --patch-validate --patch-init-fail
+```
+
+通用选项：
+
+```bash
 # 指定输出文件
-python3 detect_lk_gz.py lk.img --patch --patch-default -o my_lk.img
+python3 detect_lk_gz.py lk.img --patch-validate -o my_lk.img
 ```
 
 #### 3. 刷写
@@ -269,39 +315,47 @@ python3 patch_gz_gpt.py pgpt.bin --restore
 
 ## detect_lk_gz.py
 
-分析 LK (Little Kernel) 固件，检测 GZ 内存释放逻辑并提供补丁。支持两种补丁方式：修补 `gz_unmap_check` 函数（方案 A）和修改 `gz_enabled` 默认值（方案 B）。
+分析 LK (Little Kernel) 固件，检测 GZ 内存释放逻辑并提供补丁。自动识别两种 GZ 实现方式：
+
+- **旧式**（MT6833/MT6895 等）：GZ 逻辑在 lk 段，通过 `gz_unmap_check` + `gz_enabled` 全局变量控制
+- **新式**（MT6991 等）：GZ 逻辑在 bl2_ext 段，通过 `gz_config_validate` → `gz_init_main` 管线控制，使用 Hafnium S-EL2 + GenieZone 架构
 
 ### 检测流程
 
 1. **MTK 镜像头解析** — 解析 magic `0x58881688`，提取 LK 代码段及各子段（lk / bl2_ext / aee / dtb）
 2. **架构识别** — 支持 AArch64 和 ARM32（通过异常向量表/首指令特征自动识别）
 3. **GZ 代码检测** — 搜索 `gz_unmap2()`、`pl_boottags_gz_*_hook`、`[GZ_UNMAP2]` 等特征字符串，区分 GZ 功能代码和分区名引用
-4. **gz_unmap 检查函数定位** — 通过字符串引用回溯 BL + CBZ 调用链，定位返回 `(~gz_enabled) & 1` 的检查函数；回退方案为指令模式全局扫描
-5. **gz_enabled 全局变量定位** — 从检查函数的 ADRP+LDR（AArch64）或 LDR [PC, #off] + 字面量池（ARM32）中提取 `gz_enabled` 的文件偏移和当前值
+4. **旧式检测** — 通过字符串引用回溯 BL + CBZ 调用链，定位 `gz_unmap_check` 函数和 `gz_enabled` 全局变量
+5. **新式检测**（旧式未命中时自动尝试）— 在 bl2_ext 段搜索 `[GZ_INIT] init success/failed` 字符串，回溯 ADRP+ADD 引用定位 `gz_init_main`、`gz_config_validate`、错误清理路径
 
 ### 用法
 
 ```bash
-# 分析 LK 镜像
+# 分析 LK 镜像（自动检测类型）
 python3 detect_lk_gz.py lk.img
 
 # 预览所有补丁（不修改文件）
 python3 detect_lk_gz.py lk.img --dry-run
 
-# 方案 A: 补丁 gz_unmap_check 函数
+# 旧式方案 A: 补丁 gz_unmap_check 函数
 python3 detect_lk_gz.py lk.img --patch
 
-# 方案 B: 修改 gz_enabled 默认值 1→0
+# 旧式方案 B: 修改 gz_enabled 默认值 1→0
 python3 detect_lk_gz.py lk.img --patch-default
 
-# A+B 同时应用
-python3 detect_lk_gz.py lk.img --patch --patch-default
+# 新式方案 A: gz_config_validate 返回 0
+python3 detect_lk_gz.py lk.img --patch-validate
+
+# 新式方案 B: gz_init_main 强制失败
+python3 detect_lk_gz.py lk.img --patch-init-fail
 
 # 从备份还原
 python3 detect_lk_gz.py lk.img --restore
 ```
 
-### 支持的架构和函数模式
+### 旧式 gz_unmap_check（MT6833/MT6895 等）
+
+#### 支持的函数模式
 
 **AArch64：**
 
@@ -318,8 +372,6 @@ python3 detect_lk_gz.py lk.img --restore
 | A | LDR [PC] + LDR + MVN + AND #1 + BX LR | `return (~gz_enabled) & 1` |
 | B | LDR [PC] + LDR + EOR #1 + BX LR | `return gz_enabled ^ 1` |
 | C | LDR [PC] + LDR + CMP + MOVEQ/MOVNE + BX LR | `return (gz_enabled == 0) ? 1 : 0` |
-
-### 两种补丁方案
 
 #### 方案 A：补丁 gz_unmap_check 函数 (`--patch`)
 
@@ -362,7 +414,7 @@ void gz_plat_hook(boot_tag *tag) {
 - 配合 GPT 方案使用时，解决 boot tag 缺失导致的内存不释放问题
 - 如果 bl2_ext/aee 段也读取此变量，它们同样会看到修改后的值
 
-#### 方案选择
+#### 旧式方案选择
 
 | 场景 | 推荐 |
 |------|------|
@@ -370,7 +422,83 @@ void gz_plat_hook(boot_tag *tag) {
 | 不使用 GPT，直接禁用 GZ | 方案 A（强制释放，不依赖 gz_enabled） |
 | 最大兼容性 | A+B 同时使用 |
 
+### 新式 bl2_ext GZ 初始化管线（MT6991 等）
+
+MT6991 等新一代 SoC 使用 Hafnium S-EL2 + GenieZone 架构。GZ 初始化逻辑不再位于 lk 段，而是在 **bl2_ext** 段（独立签名）中，没有 `gz_enabled` 全局变量和 `gz_unmap_check` 函数。
+
+#### GZ 初始化流程
+
+```
+gz_init_wrapper:
+  BL   gz_config_validate     ; 检查 GZ 配置是否有效
+  TBZ  W0, #0, skip           ; 返回 0 → 跳过 GZ 初始化
+  BL   gz_init_main           ; 执行 GZ 初始化
+skip:
+  ...
+
+gz_init_main:
+  BL   gz_config_env_get      ; 获取配置环境
+  ...                         ; 加载 gz.img → 配置 → 跳转
+  → 成功: "[GZ_INIT] init success; gz will boot!!"
+  → 失败: "[GZ_INIT] config env not valid"
+           → gz_config_cleanup
+           → gz_mblock_free_all   ; 释放所有 GZ 内存
+           → "[GZ_INIT] init failed; gz is disabled from now on"
+```
+
+#### 方案 A：补丁 gz_config_validate (`--patch-validate`)
+
+将 `gz_config_validate` 中计算返回值的指令（BIC W0, W9, W8）替换为 `MOV W0, #0`。效果：
+
+- `gz_config_validate` 始终返回 0
+- `gz_init_wrapper` 的 TBZ 条件跳过 `gz_init_main` 调用
+- GZ 初始化完全不执行
+
+```
+原始:                          补丁后:
+  PACIASP                       PACIASP
+  ADRP X8, <page>               ADRP X8, <page>
+  MOV  W9, #1                   MOV  W9, #1
+  LDRB W8, [X8, #0x150]         LDRB W8, [X8, #0x150]
+  BIC  W0, W9, W8               MOV  W0, #0     ; ← 补丁
+  AUTIASP                       AUTIASP
+  RET                           RET
+```
+
+#### 方案 B：强制 gz_init_main 失败 (`--patch-init-fail`)
+
+将 `gz_init_main` 的第一条 BL（调用 `gz_config_env_get`）替换为 B（无条件跳转）到错误清理路径。效果：
+
+- `gz_init_main` 直接跳转到 "config env not valid" 错误处理
+- 执行 `gz_config_cleanup` → `gz_mblock_free_all` 释放所有 GZ 保留内存
+- 打印 "init failed; gz is disabled from now on"
+
+```
+原始:                          补丁后:
+  PACIASP                       PACIASP
+  STP  X29, X30, [SP, #-32]!    STP  X29, X30, [SP, #-32]!
+  STP  X20, X19, [SP, #16]      STP  X20, X19, [SP, #16]
+  ADD  X29, SP, #0               ADD  X29, SP, #0
+  BL   gz_config_env_get         B    cleanup_path  ; ← 补丁
+  ...                           ...
+cleanup_path:                  cleanup_path:
+  → gz_config_cleanup             → gz_config_cleanup
+  → gz_mblock_free_all            → gz_mblock_free_all
+```
+
+#### 新式方案选择
+
+| 场景 | 推荐 |
+|------|------|
+| 仅跳过 GZ | 方案 A（最小改动，不触发任何 GZ 代码） |
+| 跳过 GZ 并确保内存释放 | 方案 B（走错误清理路径，调用 `gz_mblock_free_all`） |
+| 最大兼容性 | A+B 同时使用 |
+
+> **注意**：方案 A 跳过了整个 `gz_init_main`，`gz_mblock_free_all` 可能不被调用。如果 preloader 已经为 GZ 预留了内存（通过 `gz-tee-static-shm` mblock），方案 A 不会释放这些内存。方案 B 的错误清理路径会显式调用 `gz_mblock_free_all`，因此推荐使用方案 B 或 A+B。
+
 ### 输出字段说明
+
+**旧式：**
 
 | 字段 | 含义 |
 |------|------|
@@ -379,6 +507,21 @@ void gz_plat_hook(boot_tag *tag) {
 | `模式` | 匹配的指令模式（A / B / C） |
 | `gz_enabled 全局变量` | 变量的文件偏移和当前值（1=默认启用，0=默认禁用） |
 | `调用点` | `platform_init` 中 BL 和 CBZ/BEQ 的位置 |
+
+**新式：**
+
+| 字段 | 含义 |
+|------|------|
+| `GZ 类型` | 新式初始化管线 (bl2_ext 段) |
+| `bl2_ext 代码` | bl2_ext 段的文件偏移和大小 |
+| `gz_init_main` | GZ 初始化主函数的文件偏移 |
+| `gz_config_validate` | 配置验证函数的文件偏移 |
+| `错误清理路径` | 错误处理入口的文件偏移（含 `gz_mblock_free_all`） |
+
+**通用：**
+
+| 字段 | 含义 |
+|------|------|
 | `Boot Tag 钩子` | preloader 传递 GZ 配置的 boot tag 回调函数 |
 | `DTB GZ 节点` | 设备树中的 GZ 相关节点（trusty-gz / nebula 等） |
 
@@ -387,6 +530,8 @@ void gz_plat_hook(boot_tag *tag) {
 ## 原理
 
 ### 启动流程中的 GenieZone
+
+**旧式架构（MT6833/MT6895 等）：**
 
 ```
 BROM → preloader (签名验证) → ATF → LK → kernel
@@ -399,9 +544,25 @@ BROM → preloader (签名验证) → ATF → LK → kernel
                   决定是否将 EL2 移交给 GZ  └─ DTB: trusty-gz / nebula 节点 → kernel
 ```
 
+**新式架构（MT6991 等，Hafnium S-EL2）：**
+
+```
+BROM → preloader (签名验证) → ATF → LK (bl2_ext) → LK (lk) → kernel
+              │                          │
+              ├─ gz-tee-static-shm       ├─ gz_config_validate()
+              │   mblock 预留             │   返回 0 → 跳过 GZ 初始化
+              └─ ...                     ├─ gz_init_main()
+                                         │   → gz_config_env_get
+                                         │   → 加载 gz.img → 配置 → 启动 GZ
+                                         │   → 失败路径: gz_mblock_free_all
+                                         └─ DTB: nebula / trusty-gz 节点 → kernel
+```
+
 - **GPT 方案**作用于 preloader 阶段：让 gz 分区 I/O 失败 → NoGZ → 跳过 GZ 加载
-- **LK 方案 A**：补丁 gz_unmap_check → 强制返回 1 → 释放 GZ 保留内存
-- **LK 方案 B**：修改 gz_enabled 默认值 1→0 → 无 boot tag 时 GZ 默认禁用
+- **旧式 LK 方案 A**：补丁 gz_unmap_check → 强制返回 1 → 释放 GZ 保留内存
+- **旧式 LK 方案 B**：修改 gz_enabled 默认值 1→0 → 无 boot tag 时 GZ 默认禁用
+- **新式 LK 方案 A**：补丁 gz_config_validate → 返回 0 → 跳过 bl2_ext 中的 GZ 初始化
+- **新式 LK 方案 B**：补丁 gz_init_main → 强制走失败路径 → gz_mblock_free_all 释放内存
 
 ### 无效 LBA 欺骗
 
@@ -477,9 +638,9 @@ LK 方案修改了 LK 代码/数据，签名校验不通过。需要使用不校
 **补丁后仍未释放 GZ 内存**
 
 可能原因：
-1. LK 中存在其他 GZ 检查点未被补丁（bl2_ext / aee 段有独立的 GZ 代码副本）
-2. 内核层面的 trusty-gz / nebula 驱动仍在尝试初始化 GZ（通常会优雅失败，不影响启动）
-3. 仅使用方案 A 时，`gz_enabled` 仍为 1，其他依赖此变量的代码可能有异常行为 → 建议 A+B 同时使用
+1. **旧式**：LK 中存在其他 GZ 检查点未被补丁（bl2_ext / aee 段有独立的 GZ 代码副本）；仅使用方案 A 时，`gz_enabled` 仍为 1，其他依赖此变量的代码可能有异常行为 → 建议 A+B 同时使用
+2. **新式（方案 A）**：`--patch-validate` 跳过了 `gz_init_main`，`gz_mblock_free_all` 未被调用。如果 preloader 已通过 `gz-tee-static-shm` 预留了内存，这部分内存不会被释放 → 使用 `--patch-init-fail`（方案 B）或 A+B
+3. 内核层面的 trusty-gz / nebula 驱动仍在尝试初始化 GZ（通常会优雅失败，不影响启动）
 
 ---
 
@@ -487,11 +648,13 @@ LK 方案修改了 LK 代码/数据，签名校验不通过。需要使用不校
 
 ### 已测试设备
 
-| 设备 | SoC | 系统 | 架构 | GPT 方案 |
-|------|-----|------|------|---------|
-| OPPO A55 | MT6833 | Android 13 | Thumb PIC | **可用** |
-| OPPO K9 Pro | MT6893 | Android 13 | Thumb PIC | **可用** |
-| Realme GT Neo 闪速版 | MT6893 | Android 13 | Thumb PIC | **可用** |
+| 设备 | SoC | 系统 | 架构 | GPT 方案 | LK 方案 |
+|------|-----|------|------|---------|---------|
+| OPPO A55 | MT6833 | Android 13 | Thumb PIC | **可用** | 旧式 |
+| OPPO K9 Pro | MT6893 | Android 13 | Thumb PIC | **可用** | 旧式 |
+| Realme GT Neo 闪速版 | MT6893 | Android 13 | Thumb PIC | **可用** | 旧式 |
+| — | MT6895 | — | AArch64 | 不可用 | 旧式 |
+| — | MT6991 | — | AArch64 | **不可用** | 新式 (bl2_ext) |
 
 ### 其他
 
@@ -510,7 +673,11 @@ LK 方案修改了 LK 代码/数据，签名校验不通过。需要使用不校
 - **可恢复性**：GPT 方案仅修改分区表，LK 方案自动备份原始固件，均可随时还原
 - **备份 GPT**：`patch_gz_gpt.py` 仅修改主 GPT，设备末尾的备份 GPT 可能需要同步修改
 - **LK 签名**：LK 方案修改了代码/数据，需要不校验签名的 preloader 或 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名
-- **处理器代际差异**：GPT 方案目测适用天玑 v5 及以下处理器（如 MT6833/MT6893 等）；天玑 v6 处理器（如 MT6895 等）可能需要 GPT + 修改 LK（方案 A/B），或使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 高级用法直接干掉 GenieZone
+- **处理器代际差异**：
+  - 天玑 v5 及以下（如 MT6833/MT6893）：GPT 方案通常直接可用
+  - 天玑 v6（如 MT6895）：可能需要 GPT + 旧式 LK 方案（`--patch` / `--patch-default`）
+  - 天玑 v7+（如 MT6991）：GPT 方案不可用（preloader 不加载 GZ，GZ 由 bl2_ext 负责），需使用新式 LK 方案（`--patch-validate` / `--patch-init-fail`）
+  - 或使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 高级用法直接干掉 GenieZone
 - **功能影响**：禁用 GenieZone 后，依赖 GZ 虚拟化服务的功能（如部分 DRM、安全容器等）可能不可用
 
 ## License

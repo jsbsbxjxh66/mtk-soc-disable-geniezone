@@ -3,18 +3,22 @@
 detect_lk_gz.py - 检测并修补 MediaTek LK 中的 GenieZone 内存释放逻辑
 
 分析 LK (Little Kernel) 固件:
-  1. 解析 MTK 镜像头, 提取 LK 代码段
-  2. 检测 gz_unmap 检查函数 (决定是否释放 GZ 内存)
+  1. 解析 MTK 镜像头, 提取 LK 代码段及 bl2_ext 段
+  2. 检测 gz_unmap 检查函数 (旧式, 如 MT6895) 或 GZ 初始化管线 (新式, 如 MT6991)
   3. 识别 GZ boot tag 钩子和 DTB 节点
-  4. 提供补丁: 强制 gz_unmap 检查始终返回 1 (释放 GZ 内存)
+  4. 提供补丁: 禁用 GenieZone 并释放其占用内存
 
 支持架构: AArch64, ARM32
 
-Usage:
-  python3 detect_lk_gz.py lk.img                          # 分析
+旧式 (gz_unmap_check, 如 MT6833/MT6895):
   python3 detect_lk_gz.py lk.img --patch                  # 方案A: 补丁函数
   python3 detect_lk_gz.py lk.img --patch-default           # 方案B: 改默认值
-  python3 detect_lk_gz.py lk.img --patch --patch-default   # A+B 同时应用
+
+新式 (bl2_ext GZ 初始化管线, 如 MT6991):
+  python3 detect_lk_gz.py lk.img --patch-validate          # 方案A: 跳过GZ初始化
+  python3 detect_lk_gz.py lk.img --patch-init-fail         # 方案B: 强制初始化失败+释放内存
+
+通用:
   python3 detect_lk_gz.py lk.img --dry-run                # 仅显示补丁内容
   python3 detect_lk_gz.py lk.img --restore                # 从备份还原
 """
@@ -755,6 +759,166 @@ class LKAnalyzer:
         return None, None
 
     # ────────────────────────────────────────────────────
+    #  New-style GZ init detection (bl2_ext, MT6991+)
+    # ────────────────────────────────────────────────────
+
+    def _bl2_find_adrp_ref(self, target_file_off, bl2_off, bl2_size):
+        """Find ADRP+ADD reference to a target address within bl2_ext."""
+        rel = target_file_off - bl2_off
+        page = rel & ~0xFFF
+        off_in_page = rel & 0xFFF
+        scan_limit = bl2_off + min(bl2_size, 0x100000) - 8
+        for scan in range(bl2_off, scan_limit, 4):
+            insn = struct.unpack_from('<I', self.data, scan)[0]
+            rd, adrp_page = a64_decode_adrp(insn, scan, bl2_off)
+            if rd is None or adrp_page != page:
+                continue
+            next_insn = struct.unpack_from('<I', self.data, scan + 4)[0]
+            add_rd, add_rn, add_imm = a64_decode_add_imm(next_insn)
+            if add_rn == rd and add_imm == off_in_page:
+                return scan
+        return None
+
+    def _find_bl2ext_gz_init(self):
+        """Detect new-style GZ init pipeline in bl2_ext segment (MT6991+).
+
+        Returns dict with patch locations or None if not found.
+        """
+        bl2_off = bl2_size = None
+        for seg_off, seg_name, seg_size in self.segments:
+            if seg_name == 'bl2_ext':
+                bl2_off = seg_off + MTK_HDR_SIZE
+                bl2_size = seg_size
+                break
+        if bl2_off is None:
+            return None
+
+        d = self.data
+        success_off = d.find(b'[GZ_INIT] init success; gz will boot!!',
+                             bl2_off, bl2_off + bl2_size)
+        failed_off = d.find(b'[GZ_INIT] init failed; gz is disabled from now on',
+                            bl2_off, bl2_off + bl2_size)
+        if success_off < 0 or failed_off < 0:
+            return None
+
+        success_ref = self._bl2_find_adrp_ref(success_off, bl2_off, bl2_size)
+        failed_ref = self._bl2_find_adrp_ref(failed_off, bl2_off, bl2_size)
+        if success_ref is None or failed_ref is None:
+            return None
+        if abs(success_ref - failed_ref) > 0x400:
+            return None
+
+        # Find gz_init_main function start (scan back from failed_ref for prologue)
+        init_main = None
+        for scan in range(failed_ref - 4, max(bl2_off, failed_ref - 2000), -4):
+            insn = struct.unpack_from('<I', d, scan)[0]
+            if (insn & 0xFFC07FFF) == 0xA9807BFD:  # STP X29, X30, [SP, #-N]!
+                if scan >= bl2_off + 4:
+                    prev = struct.unpack_from('<I', d, scan - 4)[0]
+                    if prev in (0xD503233F, 0xD503201F):
+                        init_main = scan - 4
+                        break
+                init_main = scan
+                break
+        if init_main is None:
+            return None
+
+        # Find BL caller of gz_init_main (in gz_init_wrapper)
+        caller_bl = None
+        for scan in range(bl2_off, bl2_off + min(bl2_size, 0x100000) - 4, 4):
+            if scan == init_main:
+                continue
+            insn = struct.unpack_from('<I', d, scan)[0]
+            bl_target = a64_decode_bl(insn, scan)
+            if bl_target == init_main:
+                caller_bl = scan
+                break
+        if caller_bl is None:
+            return None
+
+        # Look before the BL for TBZ/CBZ + BL pattern → gz_config_validate
+        validate_func = validate_bl = tbz_off = None
+        for scan in range(caller_bl - 4, max(bl2_off, caller_bl - 48), -4):
+            insn = struct.unpack_from('<I', d, scan)[0]
+            is_tbz = (insn & 0x7F80001F) == 0x36000000  # TBZ Wn, #0
+            is_cbz = (insn & 0xFF00001F) == 0x34000000   # CBZ W0
+            if not is_tbz and not is_cbz:
+                continue
+            tbz_off = scan
+            if scan < bl2_off + 4:
+                break
+            prev = struct.unpack_from('<I', d, scan - 4)[0]
+            bl_t = a64_decode_bl(prev, scan - 4)
+            if bl_t is not None and bl2_off <= bl_t < bl2_off + bl2_size:
+                validate_bl = scan - 4
+                validate_func = bl_t
+            break
+
+        # Scan validate function for the W0 return-value instruction
+        validate_patch_off = None
+        validate_patch_orig = None
+        already_patched_validate = False
+        if validate_func is not None:
+            for off in range(validate_func, min(validate_func + 40,
+                                                bl2_off + bl2_size - 4), 4):
+                insn = struct.unpack_from('<I', d, off)[0]
+                if insn == 0x52800000:  # MOV W0, #0 — already patched
+                    already_patched_validate = True
+                    validate_patch_off = off
+                    break
+                # BIC W0, Wn, Wm (0A20xxxx with Rd=0)
+                if (insn & 0xFFE0001F) == 0x0A200000:
+                    validate_patch_off = off
+                    validate_patch_orig = insn
+                    break
+                # AND W0, Wn, Wm
+                if (insn & 0xFFE0001F) == 0x0A000000 and (insn & 0x1F) == 0:
+                    validate_patch_off = off
+                    validate_patch_orig = insn
+                    break
+
+        # Find cleanup target ("config env not valid" ADRP ref within gz_init_main)
+        cleanup_target = None
+        env_off = d.find(b'[GZ_INIT] config env not valid',
+                         bl2_off, bl2_off + bl2_size)
+        if env_off >= 0:
+            env_ref = self._bl2_find_adrp_ref(env_off, bl2_off, bl2_size)
+            if env_ref is not None and init_main <= env_ref <= init_main + 0x200:
+                cleanup_target = env_ref
+
+        # Find gz_init_main's first BL or B (for method B: force failure)
+        # After patching, the BL becomes B, so scan for both.
+        init_first_bl = None
+        already_patched_init = False
+        for off in range(init_main, min(init_main + 48, bl2_off + bl2_size - 4), 4):
+            insn = struct.unpack_from('<I', d, off)[0]
+            bl_t = a64_decode_bl(insn, off)
+            if bl_t is not None:
+                init_first_bl = off
+                break
+            if (insn & 0xFC000000) == 0x14000000:
+                b_target = off + sign_ext(insn & 0x3FFFFFF, 26) * 4
+                if b_target == cleanup_target:
+                    init_first_bl = off
+                    already_patched_init = True
+                    break
+
+        return {
+            'bl2_ext_off': bl2_off,
+            'bl2_ext_size': bl2_size,
+            'init_main': init_main,
+            'caller_bl': caller_bl,
+            'validate_func': validate_func,
+            'validate_bl': validate_bl,
+            'validate_patch_off': validate_patch_off,
+            'validate_patch_orig': validate_patch_orig,
+            'already_patched_validate': already_patched_validate,
+            'init_first_bl': init_first_bl,
+            'cleanup_target': cleanup_target,
+            'already_patched_init': already_patched_init,
+        }
+
+    # ────────────────────────────────────────────────────
     #  Main analysis
     # ────────────────────────────────────────────────────
 
@@ -839,6 +1003,14 @@ class LKAnalyzer:
             r['gz_enabled_off'] = gz_off
             r['gz_enabled_value'] = gz_val
 
+        # New-style GZ init detection (bl2_ext, MT6991+)
+        # Try this when old-style gz_unmap is not found and arch is aarch64
+        r['gz_init_v2'] = None
+        if r.get('gz_unmap') is None and self.arch == 'aarch64':
+            v2 = self._find_bl2ext_gz_init()
+            if v2 is not None:
+                r['gz_init_v2'] = v2
+
         return r
 
 
@@ -918,9 +1090,10 @@ def print_results(r):
         print(f"  DTB GZ 节点: {', '.join(dtb_key[:6])}")
 
     gz = r.get('gz_unmap')
+    v2 = r.get('gz_init_v2')
     print(f"\n{'=' * 60}")
 
-    if gz is None:
+    if gz is None and v2 is None:
         if not r.get('has_gz_code'):
             if r.get('has_gz'):
                 print(f"  此 LK 不包含 GZ 功能代码 (仅有分区名/DTB 节点)")
@@ -932,46 +1105,89 @@ def print_results(r):
             print(f"  无法自动补丁, 需手动逆向分析")
         return
 
-    if gz.get('already_patched'):
-        print(f"  gz_unmap 检查函数: 0x{gz['check_func']:06X}")
-        print(f"  状态: 已补丁 (方案 A)")
-    else:
-        print(f"  gz_unmap 检查函数: 0x{gz['check_func']:06X}")
-        print(f"  检测方式: {gz.get('method', '?')}", end='')
-        if gz.get('string'):
-            print(f" (字符串 \"{gz['string']}\")", end='')
-        print()
-        print(f"  模式: {gz.get('desc', '?')}")
-        print(f"  逻辑: {gz.get('logic', '?')}")
-        print(f"  调用点: 0x{gz['bl_off']:06X} → {gz['cbz_type']} @ 0x{gz['cbz_off']:06X}")
+    # ── Old-style (gz_unmap_check) ──
+    if gz is not None:
+        if gz.get('already_patched'):
+            print(f"  gz_unmap 检查函数: 0x{gz['check_func']:06X}")
+            print(f"  状态: 已补丁 (方案 A)")
+        else:
+            print(f"  gz_unmap 检查函数: 0x{gz['check_func']:06X}")
+            print(f"  检测方式: {gz.get('method', '?')}", end='')
+            if gz.get('string'):
+                print(f" (字符串 \"{gz['string']}\")", end='')
+            print()
+            print(f"  模式: {gz.get('desc', '?')}")
+            print(f"  逻辑: {gz.get('logic', '?')}")
+            print(f"  调用点: 0x{gz['bl_off']:06X} → {gz['cbz_type']} @ 0x{gz['cbz_off']:06X}")
 
-    gz_off = r.get('gz_enabled_off')
-    gz_val = r.get('gz_enabled_value')
-    if gz_off is not None:
-        status = '默认启用' if gz_val == 1 else ('默认禁用' if gz_val == 0 else f'值={gz_val}')
-        print(f"\n  gz_enabled 全局变量: 0x{gz_off:06X} = {gz_val} ({status})")
+        gz_off = r.get('gz_enabled_off')
+        gz_val = r.get('gz_enabled_value')
+        if gz_off is not None:
+            status = '默认启用' if gz_val == 1 else ('默认禁用' if gz_val == 0 else f'值={gz_val}')
+            print(f"\n  gz_enabled 全局变量: 0x{gz_off:06X} = {gz_val} ({status})")
+
+        script = os.path.basename(sys.argv[0])
+        has_a = r.get('patchable')
+        has_b = gz_off is not None and gz_val == 1
+
+        if has_a or has_b:
+            print()
+        if has_a:
+            print(f"  方案 A: gz_unmap_check → 始终返回 1 (强制释放 GZ 内存)")
+            print(f"    python3 {script} {r['file']} --patch")
+        if has_b:
+            print(f"  方案 B: gz_enabled 默认值 1→0 (GZ 默认禁用)")
+            print(f"    python3 {script} {r['file']} --patch-default")
+        if has_a and has_b:
+            print(f"  A+B:    python3 {script} {r['file']} --patch --patch-default")
+        print()
+        return
+
+    # ── New-style (bl2_ext GZ init pipeline) ──
+    print(f"  GZ 类型: 新式初始化管线 (bl2_ext 段)")
+    print(f"  bl2_ext 代码: 0x{v2['bl2_ext_off']:06X}"
+          f"  大小: {format_size(v2['bl2_ext_size'])}")
+    print(f"  gz_init_main: 0x{v2['init_main']:06X}")
+    if v2.get('validate_func') is not None:
+        print(f"  gz_config_validate: 0x{v2['validate_func']:06X}")
+    if v2.get('cleanup_target') is not None:
+        print(f"  错误清理路径: 0x{v2['cleanup_target']:06X}"
+              f" (含 gz_mblock_free_all)")
+
+    pa = v2.get('already_patched_validate')
+    pb = v2.get('already_patched_init')
+    if pa:
+        print(f"\n  状态: 方案 A 已应用 (gz_config_validate 已补丁)")
+    if pb:
+        print(f"\n  状态: 方案 B 已应用 (gz_init_main 已补丁)")
+    if pa and pb:
+        print()
+        return
 
     script = os.path.basename(sys.argv[0])
-    has_a = r.get('patchable')
-    has_b = gz_off is not None and gz_val == 1
-
+    has_a = v2.get('validate_patch_off') is not None and not pa
+    has_b = (v2.get('init_first_bl') is not None
+             and v2.get('cleanup_target') is not None and not pb)
     if has_a or has_b:
         print()
     if has_a:
-        print(f"  方案 A: gz_unmap_check → 始终返回 1 (强制释放 GZ 内存)")
-        print(f"    python3 {script} {r['file']} --patch")
+        print(f"  方案 A: gz_config_validate → 返回 0 (跳过 GZ 初始化)")
+        print(f"    python3 {script} {r['file']} --patch-validate")
     if has_b:
-        print(f"  方案 B: gz_enabled 默认值 1→0 (GZ 默认禁用)")
-        print(f"    python3 {script} {r['file']} --patch-default")
+        print(f"  方案 B: gz_init_main → 强制失败 (触发内存释放清理)")
+        print(f"    python3 {script} {r['file']} --patch-init-fail")
     if has_a and has_b:
-        print(f"  A+B:    python3 {script} {r['file']} --patch --patch-default")
+        print(f"  A+B:    python3 {script} {r['file']}"
+              f" --patch-validate --patch-init-fail")
     print()
 
 
 def do_patch(analyzer, results, output_path, patch_func=False, patch_default=False,
-             dry_run=False):
+             patch_validate=False, patch_init_fail=False, dry_run=False):
     patched = bytearray(analyzer.data)
     any_applied = False
+
+    # ── Old-style patches ──
 
     if patch_func:
         gz = results.get('gz_unmap')
@@ -1031,6 +1247,56 @@ def do_patch(analyzer, results, output_path, patch_func=False, patch_default=Fal
             struct.pack_into('<I', patched, gz_off, 0)
             any_applied = True
 
+    # ── New-style patches (bl2_ext) ──
+
+    v2 = results.get('gz_init_v2')
+
+    if patch_validate:
+        if v2 is None:
+            print("错误: 未找到新式 GZ 初始化管线, 无法应用方案 A")
+        elif v2.get('already_patched_validate'):
+            print("方案 A: gz_config_validate 已补丁, 跳过")
+        elif v2.get('validate_patch_off') is None:
+            print("错误: 未定位 gz_config_validate 返回值指令, 无法应用方案 A")
+        else:
+            off = v2['validate_patch_off']
+            orig = struct.unpack_from('<I', analyzer.data, off)[0]
+            new_insn = 0x52800000  # MOV W0, #0
+
+            print(f"\n方案 A — gz_config_validate 补丁 (bl2_ext 段):")
+            print(f"  目标: 0x{off:06X}")
+            print(f"  原始: {orig:08X}  (返回值取决于配置字节)")
+            print(f"  补丁: {new_insn:08X}  ; MOV W0, #0")
+            print(f"  效果: gz_config_validate 始终返回 0 → 跳过 GZ 初始化")
+
+            struct.pack_into('<I', patched, off, new_insn)
+            any_applied = True
+
+    if patch_init_fail:
+        if v2 is None:
+            print("错误: 未找到新式 GZ 初始化管线, 无法应用方案 B")
+        elif v2.get('already_patched_init'):
+            print("方案 B: gz_init_main 已补丁, 跳过")
+        elif v2.get('init_first_bl') is None or v2.get('cleanup_target') is None:
+            print("错误: 未定位 gz_init_main 补丁点或清理路径, 无法应用方案 B")
+        else:
+            bl_off = v2['init_first_bl']
+            target = v2['cleanup_target']
+            orig = struct.unpack_from('<I', analyzer.data, bl_off)[0]
+            delta = (target - bl_off) // 4
+            new_insn = 0x14000000 | (delta & 0x03FFFFFF)  # B <cleanup>
+
+            print(f"\n方案 B — gz_init_main 强制失败 (bl2_ext 段):")
+            print(f"  目标: 0x{bl_off:06X}")
+            print(f"  原始: {orig:08X}  (BL gz_config_env_get)")
+            print(f"  补丁: {new_insn:08X}  ; B 0x{target:06X}")
+            print(f"  效果: gz_init_main 直接跳转到错误清理路径")
+            print(f"         → gz_mblock_free_all 释放 GZ 内存")
+            print(f"         → 打印 \"init failed; gz is disabled from now on\"")
+
+            struct.pack_into('<I', patched, bl_off, new_insn)
+            any_applied = True
+
     if not any_applied:
         return False
 
@@ -1058,17 +1324,27 @@ def main():
         description='检测并修补 MTK LK 中的 GenieZone 内存释放逻辑',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-方案 A (--patch):         补丁 gz_unmap_check 始终返回 1, 强制释放 GZ 内存
-方案 B (--patch-default): 修改 gz_enabled 默认值 1→0, GZ 默认禁用
-两种方案可单独或同时使用。配合已解锁的 bootloader 或签名绕过工具。
-支持 AArch64 和 ARM32 架构。
+旧式 (gz_unmap_check, 如 MT6833/MT6895):
+  --patch             方案 A: 补丁 gz_unmap_check 始终返回 1
+  --patch-default     方案 B: 修改 gz_enabled 默认值 1→0
+
+新式 (bl2_ext GZ 初始化管线, 如 MT6991):
+  --patch-validate    方案 A: gz_config_validate 返回 0, 跳过 GZ 初始化
+  --patch-init-fail   方案 B: gz_init_main 强制失败, 触发内存释放清理
+
+先运行不带参数的分析, 脚本会自动检测类型并显示可用方案。
+配合已解锁的 bootloader 或签名绕过工具使用。
 """)
     parser.add_argument('input', help='LK 镜像文件 (lk.img)')
     parser.add_argument('-o', '--output', help='输出文件路径')
     parser.add_argument('--patch', action='store_true',
-                        help='方案 A: 补丁 gz_unmap_check 函数')
+                        help='旧式方案 A: 补丁 gz_unmap_check 函数')
     parser.add_argument('--patch-default', action='store_true',
-                        help='方案 B: 修改 gz_enabled 默认值 1→0')
+                        help='旧式方案 B: 修改 gz_enabled 默认值 1→0')
+    parser.add_argument('--patch-validate', action='store_true',
+                        help='新式方案 A: 跳过 GZ 初始化')
+    parser.add_argument('--patch-init-fail', action='store_true',
+                        help='新式方案 B: 强制 GZ 初始化失败 + 释放内存')
     parser.add_argument('--dry-run', action='store_true', help='仅预览补丁, 不修改')
     parser.add_argument('--restore', action='store_true', help='从备份还原')
     args = parser.parse_args()
@@ -1096,19 +1372,37 @@ def main():
     results = analyzer.analyze()
     print_results(results)
 
-    want_patch = args.patch or args.patch_default
+    want_patch = (args.patch or args.patch_default
+                  or args.patch_validate or args.patch_init_fail)
     if want_patch or args.dry_run:
-        pf = args.patch or (args.dry_run and not args.patch_default)
-        pd = args.patch_default or (args.dry_run and not args.patch)
+        v2 = results.get('gz_init_v2')
 
-        can_a = results.get('patchable') or results.get('already_patched')
-        can_b = results.get('gz_enabled_off') is not None
+        # Determine which patches to apply
+        if args.dry_run and not want_patch:
+            # Dry-run with no specific flag: show all available patches
+            pf = results.get('patchable') or results.get('already_patched')
+            pd = results.get('gz_enabled_off') is not None
+            pv = v2 is not None and not v2.get('already_patched_validate')
+            pi = v2 is not None and not v2.get('already_patched_init')
+        else:
+            pf = args.patch
+            pd = args.patch_default
+            pv = args.patch_validate
+            pi = args.patch_init_fail
 
-        if pf and not can_a and not args.dry_run:
-            print("无法应用方案 A: 未找到可识别的 gz_unmap 检查函数")
-        if pd and not can_b and not args.dry_run:
-            print("无法应用方案 B: 未找到 gz_enabled 全局变量")
-        if not can_a and not can_b and not args.dry_run:
+        can_old = (results.get('patchable') or results.get('already_patched')
+                   or results.get('gz_enabled_off') is not None)
+        can_new = v2 is not None
+
+        if pf and not (results.get('patchable') or results.get('already_patched')):
+            print("错误: 未找到 gz_unmap 检查函数 (旧式方案 A)")
+        if pd and results.get('gz_enabled_off') is None:
+            print("错误: 未找到 gz_enabled 全局变量 (旧式方案 B)")
+        if pv and not can_new:
+            print("错误: 未找到新式 GZ 初始化管线 (新式方案 A)")
+        if pi and not can_new:
+            print("错误: 未找到新式 GZ 初始化管线 (新式方案 B)")
+        if not can_old and not can_new and not args.dry_run:
             sys.exit(1)
 
         if not args.dry_run and not os.path.isfile(backup_path):
@@ -1116,7 +1410,9 @@ def main():
             print(f"已备份原始文件到: {backup_path}")
 
         ok = do_patch(analyzer, results, output_path,
-                      patch_func=pf, patch_default=pd, dry_run=args.dry_run)
+                      patch_func=pf, patch_default=pd,
+                      patch_validate=pv, patch_init_fail=pi,
+                      dry_run=args.dry_run)
         if not ok and not args.dry_run:
             sys.exit(1)
 
