@@ -678,7 +678,7 @@ BROM → preloader (签名验证) → ATF → LK (bl2_ext) → LK (lk) → kerne
 
 ### GPT 方案
 
-**使用重名方案后无限重启**
+**使用重名方案后黑砖**
 
 主引导函数独立引用了 "gz" 分区名（如 MT6833），分区找不到导致致命错误。解决方案：
 1. 还原 GPT (`python3 patch_gz_gpt.py pgpt.bin --restore`)
