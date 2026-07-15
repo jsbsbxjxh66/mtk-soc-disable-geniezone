@@ -10,19 +10,22 @@
 
 | 工具 | 用途 |
 |------|------|
-| `detect_gz_bypass.py` | 分析 preloader 固件，检测 GPT 修改方案是否可用 |
-| `patch_gz_gpt.py` | 修改 GPT 分区表，将 gz 分区 LBA 指向无效地址 |
+| `detect_gz_bypass.py` | 分析 preloader 固件，检测 GPT 修改方案是否可用，推荐重名或无效 LBA 子方案 |
+| `patch_gz_gpt.py` | 修改 GPT 分区表：重名 gz→gx（`--rename`）或将 LBA 指向无效地址（默认） |
 | `detect_lk_gz.py` | 分析 LK 固件，检测并修补 GZ 内存释放逻辑（旧式 gz_unmap + 新式 bl2_ext 管线） |
 
 ## 两种方案
 
 | 方案 | 层面 | 条件 | 是否需要跳过签名 |
 |------|------|------|-----------------|
-| **GPT 方案** | Preloader | `halt_on_assert` 未被强制置 1 | 否 |
+| **GPT 重名方案** | Preloader | `halt_on_assert` 未强制置 1 且主引导循环无 gz 硬依赖 | 否 |
+| **GPT 无效 LBA 方案** | Preloader | `halt_on_assert` 未被强制置 1 | 否 |
 | **LK 旧式方案** | LK (lk 段) | LK 中存在 `gz_unmap` 检查函数 | 是 |
 | **LK 新式方案** | LK (bl2_ext 段) | bl2_ext 中存在 GZ 初始化管线 | 是 |
 
-- GPT 方案通过让 preloader 的 GZ 分区 I/O 失败来触发 NoGZ，不修改任何代码
+- GPT 方案有两个子方案，均不修改代码：
+  - **重名方案** (`--rename`)：将 gz 分区改名为 gx，`get_part_info("gz")` 找不到分区 → 无 I/O → 设置 NoGZ。需 preloader 主引导循环不独立依赖 gz 分区名解析（`detect_gz_bypass.py` 自动检测）
+  - **无效 LBA 方案**（默认）：将 gz 分区 LBA 改为越界地址，存储 I/O 失败 → 设置 NoGZ
 - LK 旧式方案（MT6895 等）— GZ 逻辑在 lk 段：
   - **方案 A** (`--patch`)：补丁 `gz_unmap_check` 函数，强制始终返回 1（释放 GZ 内存）
   - **方案 B** (`--patch-default`)：修改 `gz_enabled` 全局变量默认值 1→0（GZ 默认禁用）
@@ -46,24 +49,37 @@
 python3 detect_gz_bypass.py preloader.img
 ```
 
-输出示例（GPT 可用）：
+输出示例（GPT 可用，重名可行）：
 ```
 ============================================================
   preloader.img
 ============================================================
 
-文件大小: 434,300 bytes (0.4 MB)
+文件大小: 478,520 bytes (0.5 MB)
 GFH: load_addr=0x00201000  BASE=0x00200000  Thumb PIC
 
   NoGZ: 2 处  CMP #512: 0x260BC  set_nogz: 0x269A8
   assert_fatal: 0x2A280  halt_on_assert: 0x002E84F4
+  重名方案: 可行  (gz 代码引用 1 处, 主引导函数无 gz 引用)
 
 ============================================================
   GPT 修改方案: 可用
   halt_on_assert 未强制置 1, assert 非致命
 
+  推荐: 重名方案
+  python3 patch_gz_gpt.py --rename <pgpt.bin>
+  备选: 无效 LBA 方案
   python3 patch_gz_gpt.py <pgpt.bin>
   fastboot flash pgpt <输出文件>
+```
+
+输出示例（GPT 可用，重名不可行）：
+```
+============================================================
+  GPT 修改方案: 可用
+
+  推荐: 无效 LBA 方案 (重名不可行)
+  python3 patch_gz_gpt.py <pgpt.bin>
 ```
 
 输出示例（GPT 不可用）：
@@ -81,11 +97,14 @@ GFH: load_addr=0x00201000  BASE=0x00200000  Thumb PIC
 # 分析分区表（不修改）
 python3 patch_gz_gpt.py pgpt.bin --dry-run
 
-# 修改 gz 分区 LBA
+# 重名方案：gz→gx（推荐，detect_gz_bypass.py 提示可行时使用）
+python3 patch_gz_gpt.py pgpt.bin --rename
+
+# 无效 LBA 方案（备选）
 python3 patch_gz_gpt.py pgpt.bin
 
 # 指定输出文件名
-python3 patch_gz_gpt.py pgpt.bin -o my_output.bin
+python3 patch_gz_gpt.py pgpt.bin --rename -o my_output.bin
 ```
 
 #### 3. 刷写
@@ -222,7 +241,12 @@ python3 detect_lk_gz.py lk.img --restore
 2. **架构识别** — 自动区分 Thumb / Thumb PIC / AArch64
 3. **GenieZone 代码检测** — 搜索 `bldr_load_gz_part`、`gz_init` 等特征字符串和 NoGZ 常量 (`0x4E6F475A`)
 4. **halt_on_assert 分析** — 定位 `assert_fatal` 函数，检查 `halt_on_assert` 变量是否被无条件置 1
-5. **GPT 可行性判定** — 综合以上信息给出结论
+5. **重名可行性分析** — 双重检测：
+   - 一次检测：统计 bare "gz\0" 字符串的代码引用数（PIC / literal pool / MOVW）。2+ 引用 = 主引导循环有硬依赖 → 重名不可行
+   - 二次检测：定位主引导函数（通过 "Second Bootloader Load Failed" / "load images" 等标记字符串），扫描其中是否存在对 gz 分区名的引用。无引用 → 重名可行
+   - 两种检测交叉验证，任一检出硬依赖即判定不可行
+6. **存储类型 & LBA 风险** — 检测 UFS/eMMC 存储类型及 LBA 越界检查字符串
+7. **GPT 可行性判定及子方案推荐** — 综合以上信息给出结论
 
 ### 用法
 
@@ -241,9 +265,9 @@ python3 detect_gz_bypass.py preloader_k6983v1_64.bin
 
 | 架构 | 特征 | 已测试平台 |
 |------|------|-----------|
-| Thumb (非 PIC) | 直接地址引用 | MT6895 |
-| Thumb PIC | LDR + ADD PC 位置无关代码 | MT6833 |
-| AArch64 | ADRP + ADD 页相对寻址 | MT6983 |
+| Thumb (非 PIC) | 直接地址引用 | MT6895, K50 |
+| Thumb PIC | LDR + ADD PC 位置无关代码 | MT6833, MT6893 |
+| AArch64 | ADRP + ADD 页相对寻址 | MT6983, MT6991 |
 
 架构自动检测，无需手动指定。
 
@@ -255,15 +279,23 @@ python3 detect_gz_bypass.py preloader_k6983v1_64.bin
 
 ### GPT 判定逻辑
 
-修改 gz 分区 LBA 使其越界 → I/O 失败 → preloader 设置 NoGZ 标志 → 跳过 GZ 加载。
-
-但如果 `halt_on_assert` 被无条件置为 1，`assert_fatal` 会触发 WDT reset，设备重启进入 BROM 模式。此时 GPT 方案**不可用**。
+GPT 方案的前提是 `halt_on_assert` 未被强制置 1，否则 `assert_fatal` 会触发 WDT reset。
 
 | halt_on_assert 状态 | GPT 结论 | 含义 |
 |---------------------|---------|------|
 | 未强制置 1 | **可用** | assert 非致命，I/O 失败后正常设置 NoGZ 并继续启动 |
 | 无条件置 1 | **不可用** | assert 致命，I/O 失败触发 WDT reset |
 | 无法检测 | **未知** | 需要手动逆向分析 |
+
+GPT 可用时，脚本进一步推荐子方案：
+
+| 重名可行性 | 推荐 | 命令 |
+|-----------|------|------|
+| 可行 | 重名方案 (推荐) + 无效 LBA (备选) | `patch_gz_gpt.py --rename` |
+| 不可行 | 无效 LBA 方案 | `patch_gz_gpt.py` |
+| 未知 | 无效 LBA 方案 | `patch_gz_gpt.py` |
+
+**重名方案判定**：preloader 的 `gz_init` 加载 gz 分区时，找不到分区名会正常设置 NoGZ。但部分平台（如 MT6833）的主引导循环在 gz_init **之外**还独立调用 `name_resolver("gz")`，该调用失败导致整个引导流水线中断（跳过 LK 加载 → 无限循环）。脚本通过代码引用计数 + 主引导函数扫描双重检测来判定。
 
 ### 输出字段说明
 
@@ -276,12 +308,19 @@ python3 detect_gz_bypass.py preloader_k6983v1_64.bin
 | `assert_fatal` | assert_fatal 函数的文件偏移 |
 | `halt_on_assert` | halt_on_assert BSS 变量的内存地址 |
 | `写入点` | 无条件 STRB #1 的位置（强制置 1 的证据）|
+| `重名方案` | gz 分区重名可行性：可行 / 不可行 / 未知 |
+| `主引导函数` | 主引导函数代码范围及是否包含 gz 分区名引用 |
+| `存储类型` | UFS / eMMC |
+| `无效 LBA 欺骗` | UFS 越界风险检测 |
 
 ---
 
 ## patch_gz_gpt.py
 
-修改 GPT 分区表中 gz 分区的 LBA 地址，使其指向紧贴设备末尾的无效地址 (`total_lbas`)。
+修改 GPT 分区表中的 gz 分区，支持两种子方案：
+
+- **重名方案** (`--rename`)：将 gz 分区名改为 gx，preloader 的 `get_part_info("gz")` 找不到分区 → 无 I/O → 设置 NoGZ
+- **无效 LBA 方案**（默认）：将 gz 分区 LBA 改为越界地址 (`total_lbas`)，存储 I/O 失败 → 设置 NoGZ
 
 ### 用法
 
@@ -289,11 +328,14 @@ python3 detect_gz_bypass.py preloader_k6983v1_64.bin
 # 分析分区表（不修改）
 python3 patch_gz_gpt.py pgpt.bin --dry-run
 
-# 修改 gz 分区 LBA（自动备份到 pgpt_backup.bin）
+# 重名方案（推荐，detect_gz_bypass.py 提示可行时使用）
+python3 patch_gz_gpt.py pgpt.bin --rename
+
+# 无效 LBA 方案（备选）
 python3 patch_gz_gpt.py pgpt.bin
 
 # 指定输出文件
-python3 patch_gz_gpt.py pgpt.bin -o modified.bin
+python3 patch_gz_gpt.py pgpt.bin --rename -o modified.bin
 
 # 从备份还原
 python3 patch_gz_gpt.py pgpt.bin --restore
@@ -578,7 +620,24 @@ BROM → preloader (签名验证) → ATF → LK (bl2_ext) → LK (lk) → kerne
 - **新式 LK 方案 A**：补丁 gz_config_validate → 返回 0 → 跳过 bl2_ext 中的 GZ 初始化
 - **新式 LK 方案 B**：补丁 gz_init_main → 强制走失败路径 → gz_mblock_free_all 释放内存
 
-### 无效 LBA 欺骗
+### GPT 子方案 A: 重名方案
+
+将 gz 分区名改为 gx（保留 LBA 不变），`get_part_info("gz1")` 找不到分区 → 返回失败 → 设置 NoGZ。
+
+```
+阶段 1: gz_init()
+  read_part("gz")
+    name_resolver("gz") → "gz1" → get_part_info("gz1") → 找不到（已改名为 gx1）
+  read_part 返回 -1 → 设置 NoGZ = 0x4E6F475A  ✓
+
+阶段 2: 主分区加载循环
+  情况 A (MT6893 等): gz 加载完全封装在 gz_init 中，主循环不独立引用 "gz" → 安全 ✓
+  情况 B (MT6833 等): 主循环独立调用 name_resolver("gz") → 找不到 → 致命错误 ✗
+```
+
+**重名方案是否可行取决于 preloader 主引导函数是否独立引用 "gz" 分区名。** `detect_gz_bypass.py` 通过双重检查（代码引用计数 + 主引导函数扫描）自动判定。
+
+### GPT 子方案 B: 无效 LBA 欺骗
 
 核心发现：`get_part_info()` 只做名称匹配，不验证 LBA 地址有效性。而实际的存储 I/O 由 `func_40974` 执行，它在读取失败时返回 -1。
 
@@ -587,27 +646,26 @@ BROM → preloader (签名验证) → ATF → LK (bl2_ext) → LK (lk) → kerne
 ```
 阶段 1: gz_init()
   read_part("gz")
-    func_36d68("gz") → "gz1" → get_part_info("gz1") → 找到 ✓
+    name_resolver("gz") → "gz1" → get_part_info("gz1") → 找到 ✓
     func_40974 → 读取无效 LBA → 失败 → return -1
   read_part 返回 -1 → 设置 NoGZ = 0x4E6F475A  ✓
 
 阶段 2: 主分区加载循环
-  func_36d68("gz") → "gz1" → get_part_info("gz1") → 找到 → return 0  ✓
+  name_resolver("gz") → "gz1" → get_part_info("gz1") → 找到 → return 0  ✓
   bldr_load_gz_part()
     is_el2_enabled() → 0 (NoGZ 已设置)
     skip load gz → return 0  ✓
 ```
 
-### 为什么其他方案不可行
+无效 LBA 方案不依赖主引导函数的代码结构，兼容性更广，但存储控制器对越界 LBA 的处理因硬件而异。
+
+### 其他 GPT 修改策略
 
 | 策略 | 问题 |
 |------|------|
-| 删除 gz 分区 | `gz_init` 正确设 NoGZ，但主循环的 `func_36d68` 也找不到分区 → 致命错误 |
-| 改分区名 | 和删除一样：`get_part_info("gz1")` 找不到 → 同一个 Catch-22 |
+| 删除 gz 分区 | 等同于重名：分区找不到。在主循环独立引用 "gz" 的平台上 → 致命错误 |
 | 擦除/清零 gz 数据 | I/O 成功返回 0x200，NoGZ 不被触发，解析全零数据行为不可预测 |
 | LBA 指向 GPT 头区域 | I/O 成功读取非 GZ 数据 → 实测黑砖 |
-
-**触发 NoGZ 的唯一路径是让存储 I/O 返回 -1（I/O 失败）。**
 
 ### halt_on_assert 与 GPT 方案的关系
 
@@ -626,6 +684,12 @@ BROM → preloader (签名验证) → ATF → LK (bl2_ext) → LK (lk) → kerne
 ## 故障排查
 
 ### GPT 方案
+
+**使用重名方案后无限重启**
+
+主引导函数独立引用了 "gz" 分区名（如 MT6833），分区找不到导致致命错误。解决方案：
+1. 还原 GPT (`python3 patch_gz_gpt.py pgpt.bin --restore`)
+2. 改用无效 LBA 方案 (`python3 patch_gz_gpt.py pgpt.bin`)
 
 **亮一下 logo 就重启**
 
@@ -682,13 +746,14 @@ LK 方案修改了 LK 代码/数据，签名校验不通过。需要使用不校
 
 ### 已测试设备
 
-| 设备 | SoC | 系统 | Preloader 指令集 | LK 指令集 | GPT 方案 | LK 方案 | 已验证 |
-|------|-----|------|-----------------|----------|---------|---------|--------|
-| OPPO A55 | MT6833 | Android 13 | ARM32 Thumb PIC | ARM32 | **可用** | 不适用（LK 无 GZ 代码） | ✅ |
-| OPPO K9 Pro | MT6893 | Android 13 | ARM32 Thumb PIC | ARM32 | **可用** | 不适用（LK 无 GZ 代码） | ✅ |
-| Realme GT Neo 闪速版 | MT6893 | Android 13 | ARM32 Thumb PIC | ARM32 | **可用** | 不适用（LK 无 GZ 代码） | ✅ |
-| — | MT6895 | — | ARM32 Thumb | AArch64 | 部分可用 | 旧式 | 待测试 |
-| — | MT6991 | — | AArch64 | AArch64 | **不可用** | 新式 (bl2_ext) | 待测试 |
+| 设备 | SoC | 系统 | Preloader 指令集 | LK 指令集 | GPT 重名 | GPT LBA | LK 方案 | 已验证 |
+|------|-----|------|-----------------|----------|---------|---------|---------|--------|
+| OPPO A55 | MT6833 | Android 13 | ARM32 Thumb PIC | ARM32 | **不可行** | **可用** | 不适用（LK 无 GZ 代码） | ✅ |
+| OPPO K9 Pro | MT6893 | Android 13 | ARM32 Thumb PIC | ARM32 | 可行(未测) | **可用** | 不适用（LK 无 GZ 代码） | ✅ |
+| Realme GT Neo 闪速版 | MT6893 | Android 13 | ARM32 Thumb PIC | ARM32 | 可行(未测) | **可用** | 不适用（LK 无 GZ 代码） | ✅ |
+| — | MT6895 | — | ARM32 Thumb | AArch64 | **可行** | 部分可用 | 旧式 | 待测试 |
+| — | K50 | — | ARM32 Thumb | — | **可行** | **可用** | — | 待测试 |
+| — | MT6991 | — | AArch64 | AArch64 | — | **不可用** | 新式 (bl2_ext) | 待测试 |
 
 ### 其他
 

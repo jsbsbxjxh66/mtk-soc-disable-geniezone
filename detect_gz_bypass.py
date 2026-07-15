@@ -317,6 +317,146 @@ class PreloaderAnalyzer:
                 pos -= 1
         return pos
 
+    def _find_bare_gz_strings(self):
+        offsets = []
+        data = self.data
+        pos = 0
+        while pos < len(data) - 2:
+            p = data.find(b'gz\x00', pos)
+            if p < 0:
+                break
+            if p == 0 or data[p - 1:p] == b'\x00':
+                offsets.append(p)
+            pos = p + 1
+        return offsets
+
+    def _find_main_boot_area(self):
+        if self.base is None:
+            return None, None
+        data = self.data
+        limit = self._code_limit()
+        start = self.code_start or 0
+
+        markers = [b'Second Bootloader Load Failed',
+                   b'Loading LK Partition',
+                   b'Loading LK2 Partition',
+                   b'load images',
+                   b'LK addr:']
+        for marker in markers:
+            marker_off = data.find(marker)
+            if marker_off < 0:
+                continue
+            while marker_off > 0 and data[marker_off - 1] != 0:
+                marker_off -= 1
+
+            if not self.is_pic:
+                marker_end = data.find(b'\x00', marker_off + 1)
+                if marker_end < 0:
+                    continue
+                for sub in range(marker_off, min(marker_end, marker_off + 60)):
+                    sub_mem = sub + self.base
+                    sub_bytes = struct.pack('<I', sub_mem)
+                    pp = 0
+                    while True:
+                        pp = data.find(sub_bytes, pp, limit)
+                        if pp < 0:
+                            break
+                        for scan in range(max(start, pp - 1024), pp, 2):
+                            w = struct.unpack_from('<H', data, scan)[0]
+                            if (w & 0xF800) == 0x4800:
+                                imm = (w & 0xFF) * 4
+                                if ((scan + 4) & ~3) + imm == pp:
+                                    a = max(start, scan - 0x800)
+                                    b = min(limit, scan + 0x1000)
+                                    return a, b
+                        pp += 1
+            else:
+                for i in range(start, limit - 6, 2):
+                    w = struct.unpack_from('<H', data, i)[0]
+                    if (w & 0xF800) != 0x4800:
+                        continue
+                    rt = (w >> 8) & 7
+                    imm = (w & 0xFF) * 4
+                    lit_off = ((i + 4) & ~3) + imm
+                    if lit_off + 4 > len(data):
+                        continue
+                    lit_val = struct.unpack_from('<I', data, lit_off)[0]
+                    for j in range(i + 2, min(i + 8, len(data) - 2), 2):
+                        nw = struct.unpack_from('<H', data, j)[0]
+                        if nw == 0x4478 + rt:
+                            resolved = lit_val + (j + 4)
+                            if resolved == marker_off:
+                                a = max(start, i - 0x800)
+                                b = min(limit, i + 0x1000)
+                                return a, b
+                            break
+                        if (nw >> 11) >= 0x1D or (nw & 0xF800) == 0x4800:
+                            break
+        return None, None
+
+    def _main_boot_has_gz_partition_ref(self, area_start, area_end):
+        if area_start is None or area_end is None:
+            return None
+        data = self.data
+        gz_offsets = self._find_bare_gz_strings()
+        if not gz_offsets:
+            return None
+        gz_mem_addrs = set(off + self.base for off in gz_offsets)
+
+        if not self.is_pic:
+            for i in range(area_start, min(area_end, len(data) - 2), 2):
+                w = struct.unpack_from('<H', data, i)[0]
+                if (w & 0xF800) == 0x4800:
+                    imm = (w & 0xFF) * 4
+                    pool_off = ((i + 4) & ~3) + imm
+                    if pool_off + 4 <= len(data):
+                        val = struct.unpack_from('<I', data, pool_off)[0]
+                        if val in gz_mem_addrs:
+                            return True
+            for gz_off in gz_offsets:
+                gz_mem = gz_off + self.base
+                lo16 = gz_mem & 0xFFFF
+                hi16 = (gz_mem >> 16) & 0xFFFF
+                for i in range(area_start, min(area_end, len(data) - 8), 2):
+                    w = struct.unpack_from('<H', data, i)[0]
+                    if (w >> 11) < 0x1D:
+                        continue
+                    w2 = struct.unpack_from('<H', data, i + 2)[0]
+                    rd_w, imm_w = self._decode_movw(w, w2)
+                    if rd_w is not None and imm_w == lo16:
+                        for j in range(i + 4, min(i + 16, len(data) - 4), 2):
+                            jw = struct.unpack_from('<H', data, j)[0]
+                            if (jw >> 11) < 0x1D:
+                                continue
+                            jw2 = struct.unpack_from('<H', data, j + 2)[0]
+                            rd_t, imm_t = self._decode_movt(jw, jw2)
+                            if rd_t == rd_w and imm_t == hi16:
+                                return True
+                            break
+            return False
+        else:
+            gz_off_set = set(gz_offsets)
+            for i in range(area_start, min(area_end, len(data) - 6), 2):
+                w = struct.unpack_from('<H', data, i)[0]
+                if (w & 0xF800) != 0x4800:
+                    continue
+                rt = (w >> 8) & 7
+                imm = (w & 0xFF) * 4
+                lit_off = ((i + 4) & ~3) + imm
+                if lit_off + 4 > len(data):
+                    continue
+                lit_val = struct.unpack_from('<I', data, lit_off)[0]
+                for j in range(i + 2, min(i + 8, len(data) - 2), 2):
+                    nw = struct.unpack_from('<H', data, j)[0]
+                    if nw == 0x4478 + rt:
+                        resolved = lit_val + (j + 4)
+                        if resolved in gz_off_set:
+                            return True
+                        break
+                    if (nw >> 11) >= 0x1D or (nw & 0xF800) == 0x4800:
+                        break
+            return False
+
     # ── CMP #512 detection ──
 
     def find_cmp_512(self):
@@ -1000,6 +1140,57 @@ class PreloaderAnalyzer:
         else:
             results['gpt_viable'] = None
 
+        # ── Rename viability (primary + secondary cross-check) ──
+        gz_str_offsets = self._find_bare_gz_strings()
+        gz_total_refs = 0
+        gz_ref_details = []
+        for off in gz_str_offsets:
+            refs = self.count_string_refs(off)
+            gz_total_refs += refs
+            gz_ref_details.append(f"0x{off:05X}({refs})")
+        results['rename_gz_refs'] = gz_total_refs
+        results['rename_gz_details'] = [d for d in gz_ref_details if not d.endswith('(0)')]
+
+        boot_start, boot_end = self._find_main_boot_area()
+        main_boot_gz = None
+        if boot_start is not None:
+            main_boot_gz = self._main_boot_has_gz_partition_ref(boot_start, boot_end)
+            results['main_boot_area'] = f"0x{boot_start:05X}-0x{boot_end:05X}"
+            results['main_boot_gz_ref'] = main_boot_gz
+
+        if gz_total_refs >= 2:
+            results['rename_viable'] = False
+        elif main_boot_gz is True:
+            results['rename_viable'] = False
+            results['rename_secondary'] = True
+        elif gz_total_refs == 1 and main_boot_gz is False:
+            results['rename_viable'] = True
+        elif gz_total_refs == 1 and main_boot_gz is None:
+            results['rename_viable'] = True
+        elif gz_total_refs == 0 and main_boot_gz is False:
+            results['rename_viable'] = True
+            results['rename_secondary'] = True
+        elif gz_total_refs == 0 and boot_start is not None:
+            results['rename_viable'] = None
+        else:
+            results['rename_viable'] = None
+
+        # ── Storage type & LBA risk ──
+        has_ufs = any(self.data.find(s) >= 0
+                      for s in [b'[UFS]', b'ufs_aio', b'UFS_'])
+        has_emmc = any(self.data.find(s) >= 0
+                       for s in [b'[eMMC]', b'emmc_', b'EMMC_'])
+        results['storage_type'] = 'UFS' if has_ufs else ('eMMC' if has_emmc else None)
+        lba_checks = []
+        for s in [b'LBA out of range', b'lba_out_of_range',
+                  b'ufs_aio_check_lba', b'invalid LBA', b'INVALID_LBA']:
+            p = self.data.find(s)
+            if p >= 0:
+                lba_checks.append(f'"{s.decode()}" @0x{p:05X}')
+        results['lba_risk'] = len(lba_checks) > 0
+        results['lba_risk_strings'] = lba_checks
+        results['lba_ufs_risk'] = has_ufs and results['lba_risk']
+
         return results
 
 
@@ -1044,18 +1235,71 @@ def print_results(r):
     print()
 
     gpt = r.get('gpt_viable')
+    rename = r.get('rename_viable')
+    lba_ufs_risk = r.get('lba_ufs_risk', False)
+    storage = r.get('storage_type')
+
     print(f"\n{'='*60}")
+    print(f"  GPT 修改方案: {'可用' if gpt is True else '不可用' if gpt is False else '未知'}")
     if gpt is True:
-        print(f"  GPT 修改方案: 可用")
         print(f"  halt_on_assert 未强制置 1, assert 非致命")
-        print(f"\n  python3 patch_gz_gpt.py <pgpt.bin>")
-        print(f"  fastboot flash pgpt <输出文件>")
     elif gpt is False:
-        print(f"  GPT 修改方案: 不可用")
         print(f"  halt_on_assert 被无条件置 1, assert_fatal 触发 WDT reset")
     else:
-        print(f"  GPT 修改方案: 未知")
         print(f"  无法自动检测 halt_on_assert 状态, 需手动分析")
+
+    if storage:
+        print(f"  存储类型: {storage}")
+
+    gz_refs = r.get('rename_gz_refs', 0)
+    gz_details = r.get('rename_gz_details', [])
+    secondary = r.get('rename_secondary', False)
+    main_boot_gz = r.get('main_boot_gz_ref')
+    boot_area = r.get('main_boot_area', '?')
+    print(f"\n  重名方案 (gz→gx):", end="")
+    if rename is True:
+        print(f" 可行")
+        if gz_refs > 0:
+            print(f"    \"gz\" {gz_refs} 处代码引用 ({', '.join(gz_details)})")
+        if main_boot_gz is False:
+            print(f"    主引导函数 ({boot_area}) 无 gz 分区名引用")
+        elif main_boot_gz is None and gz_refs <= 1:
+            print(f"    仅 gz_init 引用, 主循环无硬依赖")
+    elif rename is False:
+        print(f" 不可行")
+        if gz_refs >= 2:
+            print(f"    \"gz\" {gz_refs} 处代码引用 ({', '.join(gz_details)})")
+        if main_boot_gz is True:
+            print(f"    主引导函数 ({boot_area}) 包含 gz 分区名引用")
+        print(f"    主引导循环依赖 gz 名称解析, 重名导致引导流水线中断")
+    else:
+        print(f" 未知 (未找到 \"gz\" 引用或使用内联构造)")
+
+    print(f"  无效 LBA 欺骗:", end="")
+    if not lba_ufs_risk:
+        print(f"    可行")
+    else:
+        print(f"    有 UFS 越界风险")
+        for s in r.get('lba_risk_strings', []):
+            print(f"      {s}")
+        print(f"    patch 设定的 LBA 若超出 UFS 容量, 控制器可能拒绝 I/O")
+
+    print(f"\n{'='*60}")
+    if gpt is False:
+        print(f"  GPT 方案不可用 → 需修改 LK 或 bl2_ext 补丁 (v6 设备)")
+    elif gpt is True or gpt is None:
+        prefix = "推荐" if gpt is True else "如 GPT 可用"
+        if rename is True:
+            print(f"  {prefix}: 重名方案")
+            print(f"  python3 patch_gz_gpt.py --rename <pgpt.bin>")
+            print(f"  备选: 无效 LBA 方案")
+            print(f"  python3 patch_gz_gpt.py <pgpt.bin>")
+        elif rename is False:
+            print(f"  {prefix}: 无效 LBA 方案 (重名不可行)")
+            print(f"  python3 patch_gz_gpt.py <pgpt.bin>")
+        else:
+            print(f"  {prefix}: 无效 LBA 方案 (重名未知)")
+            print(f"  python3 patch_gz_gpt.py <pgpt.bin>")
 
     print()
 

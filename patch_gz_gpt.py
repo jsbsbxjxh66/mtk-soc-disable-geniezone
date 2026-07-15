@@ -2,11 +2,14 @@
 """
 patch_gz_gpt.py - Disable MediaTek GenieZone by patching GPT partition table
 
-将 gz 分区 LBA 指向设备容量+1（越界 1 扇区），使 preloader 的
-func_40974 I/O 失败返回 -1，触发 NoGZ 标志，跳过 GZ 加载。
+禁用 GenieZone 的 GPT 修改工具。两种模式：
+
+  默认模式: 将 gz 分区 LBA 指向越界地址，使存储 I/O 失败 → NoGZ
+  改名模式: 将 gz 分区名改为 gx，使 get_part_info 找不到 → 无 I/O → NoGZ
 
 Usage:
   python3 patch_gz_gpt.py <pgpt.bin>                # 修改 gz 分区 LBA
+  python3 patch_gz_gpt.py <pgpt.bin> --rename       # 改分区名 gz→gx
   python3 patch_gz_gpt.py <pgpt.bin> --dry-run      # 仅分析不修改
   python3 patch_gz_gpt.py <pgpt.bin> --restore      # 从备份还原
 """
@@ -180,15 +183,34 @@ def apply_patch(data, gz_parts, total_lbas):
         struct.pack_into('<Q', data, p['offset'] + 40, new_end)
 
 
+def apply_rename(data, gz_parts):
+    print(f"\n  原理: 改名后 get_part_info(\"gz1\") 返回 NULL → 无 I/O → NoGZ")
+
+    for p in gz_parts:
+        old_name = p['name']
+        new_name = old_name.replace('gz', 'gx').replace('GZ', 'GX')
+        new_name_bytes = new_name.encode('utf-16-le')
+        name_field = new_name_bytes.ljust(72, b'\x00')
+
+        print(f"\n  分区 #{p['index']}:")
+        print(f"    名称: \"{old_name}\" → \"{new_name}\"")
+
+        data[p['offset'] + 56:p['offset'] + 56 + 72] = name_field
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='修改 GPT 分区表以禁用 GenieZone',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-将 gz 分区 LBA 指向紧贴设备末尾的无效地址，触发 I/O 失败 → NoGZ。
+默认: 将 gz 分区 LBA 指向越界地址，触发 I/O 失败 → NoGZ。
+--rename: 改分区名 gz→gx，get_part_info 找不到分区 → 无 I/O → NoGZ。
+         改名模式不触发 UFS 越界读取，适用于 UFS 控制器不容忍越界 LBA 的设备。
 """)
     parser.add_argument('input', help='GPT 分区表文件 (pgpt.bin)')
     parser.add_argument('-o', '--output', help='输出文件路径')
+    parser.add_argument('--rename', action='store_true',
+                        help='改分区名 (gz→gx) 代替改 LBA，避免 UFS 越界 I/O')
     parser.add_argument('--dry-run', action='store_true', help='仅分析不修改')
     parser.add_argument('--restore', action='store_true', help='从备份还原')
     args = parser.parse_args()
@@ -286,8 +308,12 @@ def main():
     data = bytearray(raw)
 
     # ── 5. 应用修改 ──
-    print(f"\n修改详情:")
-    apply_patch(data, gz_parts, total_lbas)
+    method = "rename" if args.rename else "lba"
+    print(f"\n修改详情 ({('改名 gz→gx' if method == 'rename' else '改 LBA 越界')}):")
+    if method == 'rename':
+        apply_rename(data, gz_parts)
+    else:
+        apply_patch(data, gz_parts, total_lbas)
 
     # ── 6. 更新 CRC ──
     new_ecrc, new_hcrc = update_crcs(data, hdr_off, entries_off, num_entries, entry_size)
