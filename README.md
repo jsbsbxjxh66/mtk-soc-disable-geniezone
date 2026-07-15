@@ -573,7 +573,7 @@ cleanup_path:                  cleanup_path:
 
 ### 启动流程中的 GenieZone
 
-**旧式架构（MT6833/MT6893 等，LK 无 GZ 代码）：**
+**旧式架构（MT6833/MT6893 等，preloader 初始化 gz，LK 无 GZ 代码）：**
 
 ```
 BROM → preloader (签名验证) → ATF → LK → kernel
@@ -586,7 +586,7 @@ BROM → preloader (签名验证) → ATF → LK → kernel
                   决定是否将 EL2 移交给 GZ
 ```
 
-**旧式架构（MT6895 等，LK 含 GZ 代码）：**
+**v6 旧式架构（MT6895 等，preloader 初始化 gz，LK 含 GZ 代码）：**
 
 ```
 BROM → preloader (签名验证) → ATF → LK → kernel
@@ -599,7 +599,7 @@ BROM → preloader (签名验证) → ATF → LK → kernel
                   决定是否将 EL2 移交给 GZ  └─ DTB: trusty-gz / nebula 节点 → kernel
 ```
 
-**新式架构（MT6991 等，Hafnium S-EL2）：**
+**v6 新式架构带 AVF（MT6991 等，bl2_ext 初始化 gz，Hafnium S-EL2）：**
 
 ```
 BROM → preloader (签名验证) → ATF → LK (bl2_ext) → LK (lk) → kernel
