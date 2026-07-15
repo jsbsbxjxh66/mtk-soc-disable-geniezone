@@ -573,7 +573,7 @@ cleanup_path:                  cleanup_path:
 
 ### 启动流程中的 GenieZone
 
-**旧式架构（MT6833/MT6893 等，preloader 初始化 gz，LK 无 GZ 代码）：**
+**v5 旧式架构（MT6833/MT6893 等，preloader 初始化 gz（存在不初始化 gz 的 preloader），LK 无 GZ 代码）：**
 
 ```
 BROM → preloader (签名验证) → ATF → LK → kernel
