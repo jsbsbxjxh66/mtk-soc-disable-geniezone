@@ -742,8 +742,8 @@ LK 方案修改了 LK 代码/数据，签名校验不通过。需要使用不校
 | 设备 | SoC | 系统 | Preloader 指令集 | LK 指令集 | GPT 重名 | GPT LBA | LK 方案 | 已验证 |
 |------|-----|------|-----------------|----------|---------|---------|---------|--------|
 | OPPO A55 | MT6833 | Android 13 | ARM32 Thumb PIC | ARM32 | **不可行** | **可用** | 不适用（LK 无 GZ 代码） | ✅ |
-| OPPO K9 Pro | MT6893 | Android 13 | ARM32 Thumb PIC | ARM32 | 可行(未测) | **可用** | 不适用（LK 无 GZ 代码） | ✅ |
-| Realme GT Neo 闪速版 | MT6893 | Android 13 | ARM32 Thumb PIC | ARM32 | 可行(未测) | **可用** | 不适用（LK 无 GZ 代码） | ✅ |
+| OPPO K9 Pro | MT6893 | Android 13 | ARM32 Thumb PIC | ARM32 | 未测试 | **可用** | 不适用（LK 无 GZ 代码） | ✅ |
+| Realme GT Neo 闪速版 | MT6893 | Android 13 | ARM32 Thumb PIC | ARM32 | 未测试 | **可用** | 不适用（LK 无 GZ 代码） | ✅ |
 | — | MT6895 | — | ARM32 Thumb | AArch64 | **可行** | 部分可用 | 旧式 | 待测试 |
 | — | MT6991 | — | AArch64 | AArch64 | — | **不可用** | 新式 (bl2_ext) | 待测试 |
 
