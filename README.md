@@ -26,10 +26,10 @@
 - GPT 方案有两个子方案，均不修改代码：
   - **重名方案** (`--rename`)：将 gz 分区改名为 gx，`get_part_info("gz")` 找不到分区 → 无 I/O → 设置 NoGZ。需 preloader 主引导循环不独立依赖 gz 分区名解析（`detect_gz_bypass.py` 自动检测）
   - **无效 LBA 方案**（默认）：将 gz 分区 LBA 改为越界地址，存储 I/O 失败 → 设置 NoGZ
-- LK 旧式方案（MT6895 等）— GZ 逻辑在 lk 段：
+- LK v6 旧式方案（MT6895 等）— preloader 初始化 gz，GZ 逻辑在 lk 段：
   - **方案 A** (`--patch`)：补丁 `gz_unmap_check` 函数，强制始终返回 1（释放 GZ 内存）
   - **方案 B** (`--patch-default`)：修改 `gz_enabled` 全局变量默认值 1→0（GZ 默认禁用）
-- LK 新式方案（MT6991 等）— GZ 逻辑在 bl2_ext 段，使用 Hafnium S-EL2 + GenieZone 架构：
+- LK v6 新式方案带 AVF（MT6991 等）— GZ 逻辑在 bl2_ext 段，使用 Hafnium S-EL2 + GenieZone 架构：
   - **方案 A** (`--patch-validate`)：补丁 `gz_config_validate` 返回 0，跳过 GZ 初始化
   - **方案 B** (`--patch-init-fail`)：强制 `gz_init_main` 跳转到错误清理路径，触发 `gz_mblock_free_all` 释放内存
 - 脚本自动检测 LK 类型（旧式/新式），显示对应的可用方案
