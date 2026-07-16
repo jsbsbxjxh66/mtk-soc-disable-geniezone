@@ -10,8 +10,8 @@
 
 | 工具 | 用途 |
 |------|------|
-| `detect_gz_bypass.py` | 分析 preloader 固件，检测 GPT 修改方案是否可用，推荐重名或无效 LBA 子方案 |
-| `patch_gz_gpt.py` | 修改 GPT 分区表：重名 gz→gx（`--rename`）或将 LBA 指向无效地址（默认） |
+| `detect_gz_bypass.py` | 分析 preloader 固件，检测 GPT 修改方案是否可用，推荐无效 LBA 或重名子方案 |
+| `patch_gz_gpt.py` | 修改 GPT 分区表（PGPT + SGPT）：重名 gz→gx（`--rename`）或将 LBA 指向无效地址（默认） |
 | `detect_lk_gz.py` | 分析 LK 固件，检测并修补 GZ 内存释放逻辑（旧式 gz_unmap + 新式 bl2_ext 管线） |
 
 ## 两种方案
@@ -52,79 +52,70 @@ python3 detect_gz_bypass.py preloader.img
 输出示例（GPT 可用，重名可行）：
 ```
 ============================================================
-  preloader.img
-============================================================
-
-文件大小: 478,520 bytes (0.5 MB)
-GFH: load_addr=0x00201000  BASE=0x00200000  Thumb PIC
-
-  NoGZ: 2 处  CMP #512: 0x260BC  set_nogz: 0x269A8
-  assert_fatal: 0x2A280  halt_on_assert: 0x002E84F4
-  重名方案: 可行  (gz 代码引用 1 处, 主引导函数无 gz 引用)
-
-============================================================
-  GPT 修改方案: 可用
-  halt_on_assert 未强制置 1, assert 非致命
-
-  推荐: 重名方案
-  python3 patch_gz_gpt.py --rename <pgpt.bin>
-  备选: 无效 LBA 方案
+  推荐: 无效 LBA 方案 (只需修改 PGPT)
   python3 patch_gz_gpt.py <pgpt.bin>
-  fastboot flash pgpt <输出文件>
+  备选: 重名方案 (可能需同时修改 PGPT 和 SGPT)
+  python3 patch_gz_gpt.py --rename <pgpt.bin> --sgpt <sgpt.bin>
+
+  * 以上结果仅供参考, 实际可行性因固件版本和设备而异
 ```
 
 输出示例（GPT 可用，重名不可行）：
 ```
 ============================================================
-  GPT 修改方案: 可用
-
-  推荐: 无效 LBA 方案 (重名不可行)
+  推荐: 无效 LBA 方案 (只需修改 PGPT)
   python3 patch_gz_gpt.py <pgpt.bin>
+  重名方案: 不可行
+
+  * 以上结果仅供参考, 实际可行性因固件版本和设备而异
 ```
 
 输出示例（GPT 不可用）：
 ```
 ============================================================
-  GPT 修改方案: 不可用
-  halt_on_assert 被无条件置 1, assert_fatal 触发 WDT reset
+  GPT 方案不可用 → 需修改 LK 或 bl2_ext 补丁 (v6 设备)
+
+  * 以上结果仅供参考, 实际可行性因固件版本和设备而异
 ```
 
 #### 2. 修改分区表
 
-确认 GPT 方案可用后，提取设备的 `pgpt.bin` 并修改：
+确认 GPT 方案可用后，提取设备的 `pgpt.bin`（和可选的 `sgpt.bin`）并修改：
 
 ```bash
 # 分析分区表（不修改）
 python3 patch_gz_gpt.py pgpt.bin --dry-run
 
-# 重名方案：gz→gx（推荐，detect_gz_bypass.py 提示可行时使用）
-python3 patch_gz_gpt.py pgpt.bin --rename
-
-# 无效 LBA 方案（备选）
+# 无效 LBA 方案（推荐，只需修改 PGPT）
 python3 patch_gz_gpt.py pgpt.bin
 
+# 重名方案（备选，可能需同时修改 PGPT 和 SGPT）
+python3 patch_gz_gpt.py pgpt.bin --rename --sgpt sgpt.bin
+
 # 指定输出文件名
-python3 patch_gz_gpt.py pgpt.bin --rename -o my_output.bin
+python3 patch_gz_gpt.py pgpt.bin -o my_output.bin
 ```
 
 #### 3. 刷写
 
 ```bash
-# 使用底层工具刷写修补后的 pgpt_patched.bin 到 pgpt 分区
+# 使用底层工具刷写修补后的分区表
 # mtkclient / geekflashtool / unlocktool 等均可
 
 # 或通过 fastboot
 fastboot flash pgpt pgpt_patched.bin
+fastboot flash sgpt sgpt_patched.bin   # 如果同时修改了 SGPT
 ```
 
 #### 4. 还原
 
 ```bash
-# 使用脚本还原
-python3 patch_gz_gpt.py pgpt.bin --restore
+# 使用脚本还原（同时还原 PGPT 和 SGPT）
+python3 patch_gz_gpt.py pgpt.bin --sgpt sgpt.bin --restore
 
 # 或直接刷回备份
 fastboot flash pgpt pgpt_backup.bin
+fastboot flash sgpt sgpt_backup.bin
 ```
 
 ### 方案二：LK 方案
@@ -291,9 +282,11 @@ GPT 可用时，脚本进一步推荐子方案：
 
 | 重名可行性 | 推荐 | 命令 |
 |-----------|------|------|
-| 可行 | 重名方案 (推荐) + 无效 LBA (备选) | `patch_gz_gpt.py --rename` |
-| 不可行 | 无效 LBA 方案 | `patch_gz_gpt.py` |
-| 未知 | 无效 LBA 方案 | `patch_gz_gpt.py` |
+| 可行 | 无效 LBA (推荐) + 重名 (备选) | `patch_gz_gpt.py <pgpt.bin>` |
+| 不可行 | 无效 LBA 方案 | `patch_gz_gpt.py <pgpt.bin>` |
+| 未知 | 无效 LBA 方案 | `patch_gz_gpt.py <pgpt.bin>` |
+
+无效 LBA 方案只需修改 PGPT，重名方案可能需同时修改 PGPT 和 SGPT（`--sgpt`）。
 
 **重名方案判定**：preloader 的 `gz_init` 加载 gz 分区时，找不到分区名会正常设置 NoGZ。但部分平台（如 MT6833）的主引导循环在 gz_init **之外**还独立调用 `name_resolver("gz")`，该调用失败导致整个引导流水线中断（跳过 LK 加载 → 无限循环）。脚本通过代码引用计数 + 主引导函数扫描双重检测来判定。
 
@@ -317,7 +310,7 @@ GPT 可用时，脚本进一步推荐子方案：
 
 ## patch_gz_gpt.py
 
-修改 GPT 分区表中的 gz 分区，支持两种子方案：
+修改 GPT 分区表中的 gz 分区，支持 PGPT（主分区表）和 SGPT（备份分区表）同时修改，两种子方案：
 
 - **重名方案** (`--rename`)：将 gz 分区名改为 gx，preloader 的 `get_part_info("gz")` 找不到分区 → 无 I/O → 设置 NoGZ
 - **无效 LBA 方案**（默认）：将 gz 分区 LBA 改为越界地址 (`total_lbas`)，存储 I/O 失败 → 设置 NoGZ
@@ -328,30 +321,37 @@ GPT 可用时，脚本进一步推荐子方案：
 # 分析分区表（不修改）
 python3 patch_gz_gpt.py pgpt.bin --dry-run
 
-# 重名方案（推荐，detect_gz_bypass.py 提示可行时使用）
-python3 patch_gz_gpt.py pgpt.bin --rename
-
-# 无效 LBA 方案（备选）
+# 无效 LBA 方案（推荐，只需修改 PGPT）
 python3 patch_gz_gpt.py pgpt.bin
 
-# 指定输出文件
-python3 patch_gz_gpt.py pgpt.bin --rename -o modified.bin
+# 重名方案（备选，可能需同时修改 PGPT 和 SGPT）
+python3 patch_gz_gpt.py pgpt.bin --rename --sgpt sgpt.bin
 
-# 从备份还原
-python3 patch_gz_gpt.py pgpt.bin --restore
+# 指定输出文件
+python3 patch_gz_gpt.py pgpt.bin -o modified.bin
+
+# 从备份还原（同时还原 SGPT）
+python3 patch_gz_gpt.py pgpt.bin --sgpt sgpt.bin --restore
 ```
 
 ### 特性
 
+- 支持同时修改 PGPT 和 SGPT（`--sgpt`），确保主备分区表一致
 - 自动检测扇区大小（512 字节 eMMC / 4096 字节 UFS）
-- 自动备份原始文件
+- 自动检测 SGPT 格式（GPT 头在文件末尾，分区条目在文件开头）
+- 自动备份原始文件（PGPT 和 SGPT 各自独立备份）
 - CRC32 校验自动更新（Header CRC + Entries CRC）
 - 支持 gz/gz1/gz2/gz_a/gz_b 等所有 A/B 分区命名
-- 仅修改主 GPT (Primary GPT)
+- SGPT 中 gz 分区已被删除时自动跳过，不报错
 
-### 提取 pgpt.bin
+### 提取 pgpt.bin / sgpt.bin
 
-使用 mtkclient / geekflashtool / unlocktool 等工具从设备提取 `pgpt` 分区。部分设备也支持 fastboot，具体分区路径视设备而定。
+使用 mtkclient / geekflashtool / unlocktool 等工具从设备提取 `pgpt` 和 `sgpt` 分区。也可使用 `mtk-pgpt-tool/dump_pgpt.sh` 在已 root 设备上直接提取：
+
+```bash
+sh dump_pgpt.sh read         # 提取 PGPT
+sh dump_pgpt.sh read-sgpt    # 提取 SGPT
+```
 
 ---
 
@@ -762,10 +762,10 @@ LK 方案修改了 LK 代码/数据，签名校验不通过。需要使用不校
 - **UFS 崩溃**：部分 UFS 控制器在遇到越界 LBA 时会崩溃而非返回错误（GPT 方案）
 - **OTA 更新**：系统 OTA 可能还原 GPT / LK 到原始状态，需要重新修改
 - **可恢复性**：GPT 方案仅修改分区表，LK 方案自动备份原始固件，均可随时还原
-- **备份 GPT**：`patch_gz_gpt.py` 仅修改主 GPT，设备末尾的备份 GPT 可能需要同步修改
+- **备份 GPT**：使用 `--sgpt` 同时修改 PGPT 和 SGPT，确保主备分区表一致。部分 preloader 在主 GPT 校验失败时会回退到备份 GPT，仅修改 PGPT 可能因 SGPT 中 gz 分区仍有效而导致方案失效
 - **LK 签名**：LK 方案修改了代码/数据，需要不校验签名的 preloader 或 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名
 - **处理器代际差异**：
-  - 天玑 v5 及以下（如 MT6833/MT6893）：GPT 方案通常直接可用，LK 无 GZ 代码不需要 LK 方案
+  - 天玑 v5 及以下（如 MT6833/MT6893）：GPT LBA 方案通常直接可用，LK 无 GZ 代码不需要 LK 方案
   - 天玑 v6（如 MT6895）：可能需要 GPT + 旧式 LK 方案（`--patch` / `--patch-default`）
   - 天玑 v6+（如 MT6991）：GPT 方案不可用（修改 GPT 后能进 fastboot 但无法正常启动，bl2_ext 中 GZ 初始化的部分执行导致不可逆硬件配置变更），需使用新式 LK 方案（`--patch-validate` / `--patch-init-fail`）
   - 或使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 高级用法直接干掉 GenieZone

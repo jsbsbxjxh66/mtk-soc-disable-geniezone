@@ -1073,6 +1073,7 @@ class PreloaderAnalyzer:
         cmp_sites = self.find_cmp_512()
         results['cmp_512_count'] = len(cmp_sites)
         found_gz_func = False
+        assert_in_error_path = False
 
         for cmp_off, cmp_rn in cmp_sites:
             br = self.find_conditional_branch(cmp_off + 4, max_bytes=16)
@@ -1103,6 +1104,7 @@ class PreloaderAnalyzer:
             results['bldr_load_gz_part'] = f"0x{cmp_off:05X}"
 
             # Find assert_fatal in error path BL targets
+            assert_in_error_path = False
             bl_targets = self.find_bl_targets(error_start, error_end)
             for bl_off, bl_target in bl_targets:
                 if bl_target >= len(self.data):
@@ -1112,6 +1114,7 @@ class PreloaderAnalyzer:
                     continue
                 hoa = self.find_halt_on_assert_in_func(bl_target)
                 if hoa is not None:
+                    assert_in_error_path = True
                     results['assert_fatal_addr'] = f"0x{bl_target:05X}"
                     results['halt_on_assert_addr'] = f"0x{hoa:08X}"
                     strb_sites = self.check_unconditional_strb_one(hoa)
@@ -1123,6 +1126,7 @@ class PreloaderAnalyzer:
 
         # Fallback: global scan for halt_on_assert if not found via error path
         if found_gz_func and results.get('halt_on_assert_addr') is None:
+            assert_in_error_path = False
             af_addr, hoa = self.find_assert_fatal_global()
             if af_addr is not None and hoa is not None:
                 results['assert_fatal_addr'] = f"0x{af_addr:05X} (global)"
@@ -1132,10 +1136,17 @@ class PreloaderAnalyzer:
                 if strb_sites:
                     results['halt_on_assert_writers'] = [f"0x{s:05X}" for s in strb_sites]
 
+        results['assert_in_error_path'] = assert_in_error_path
+
         # GPT approach evaluation
-        if results['halt_on_assert_forced'] is True:
+        # halt_on_assert only blocks GPT when assert_fatal is in gz_init's
+        # own error path. If found only via global scan, the error path
+        # does not call assert_fatal and GPT manipulation is safe.
+        if assert_in_error_path and results['halt_on_assert_forced'] is True:
             results['gpt_viable'] = False
         elif results['halt_on_assert_forced'] is False:
+            results['gpt_viable'] = True
+        elif not assert_in_error_path and found_gz_func:
             results['gpt_viable'] = True
         else:
             results['gpt_viable'] = None
@@ -1158,7 +1169,7 @@ class PreloaderAnalyzer:
             results['main_boot_area'] = f"0x{boot_start:05X}-0x{boot_end:05X}"
             results['main_boot_gz_ref'] = main_boot_gz
 
-        if results['halt_on_assert_forced'] is True:
+        if assert_in_error_path and results['halt_on_assert_forced'] is True:
             results['rename_viable'] = False
             results['rename_blocked_by_hoa'] = True
         elif gz_total_refs >= 2:
@@ -1242,12 +1253,15 @@ def print_results(r):
     lba_ufs_risk = r.get('lba_ufs_risk', False)
     storage = r.get('storage_type')
 
+    assert_in_ep = r.get('assert_in_error_path', False)
     print(f"\n{'='*60}")
     print(f"  GPT 修改方案: {'可用' if gpt is True else '不可用' if gpt is False else '未知'}")
-    if gpt is True:
+    if gpt is True and not assert_in_ep and r.get('halt_on_assert_forced') is True:
+        print(f"  halt_on_assert 被置 1, 但 gz_init 错误路径不调用 assert_fatal")
+    elif gpt is True:
         print(f"  halt_on_assert 未强制置 1, assert 非致命")
     elif gpt is False:
-        print(f"  halt_on_assert 被无条件置 1, assert_fatal 触发 WDT reset")
+        print(f"  halt_on_assert 被无条件置 1, assert_fatal 在 gz_init 错误路径中")
     else:
         print(f"  无法自动检测 halt_on_assert 状态, 需手动分析")
 
@@ -1296,18 +1310,17 @@ def print_results(r):
         print(f"  GPT 方案不可用 → 需修改 LK 或 bl2_ext 补丁 (v6 设备)")
     elif gpt is True or gpt is None:
         prefix = "推荐" if gpt is True else "如 GPT 可用"
+        print(f"  {prefix}: 无效 LBA 方案 (只需修改 PGPT)")
+        print(f"  python3 patch_gz_gpt.py <pgpt.bin>")
         if rename is True:
-            print(f"  {prefix}: 重名方案")
-            print(f"  python3 patch_gz_gpt.py --rename <pgpt.bin>")
-            print(f"  备选: 无效 LBA 方案")
-            print(f"  python3 patch_gz_gpt.py <pgpt.bin>")
+            print(f"  备选: 重名方案 (可能需同时修改 PGPT 和 SGPT)")
+            print(f"  python3 patch_gz_gpt.py --rename <pgpt.bin> --sgpt <sgpt.bin>")
         elif rename is False:
-            print(f"  {prefix}: 无效 LBA 方案 (重名不可行)")
-            print(f"  python3 patch_gz_gpt.py <pgpt.bin>")
+            print(f"  重名方案: 不可行")
         else:
-            print(f"  {prefix}: 无效 LBA 方案 (重名未知)")
-            print(f"  python3 patch_gz_gpt.py <pgpt.bin>")
+            print(f"  重名方案: 未知")
 
+    print(f"\n  * 以上结果仅供参考, 实际可行性因固件版本和设备而异")
     print()
 
 
