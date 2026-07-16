@@ -1158,7 +1158,10 @@ class PreloaderAnalyzer:
             results['main_boot_area'] = f"0x{boot_start:05X}-0x{boot_end:05X}"
             results['main_boot_gz_ref'] = main_boot_gz
 
-        if gz_total_refs >= 2:
+        if results['halt_on_assert_forced'] is True:
+            results['rename_viable'] = False
+            results['rename_blocked_by_hoa'] = True
+        elif gz_total_refs >= 2:
             results['rename_viable'] = False
         elif main_boot_gz is True:
             results['rename_viable'] = False
@@ -1256,6 +1259,7 @@ def print_results(r):
     secondary = r.get('rename_secondary', False)
     main_boot_gz = r.get('main_boot_gz_ref')
     boot_area = r.get('main_boot_area', '?')
+    blocked_by_hoa = r.get('rename_blocked_by_hoa', False)
     print(f"\n  重名方案 (gz→gx):", end="")
     if rename is True:
         print(f" 可行")
@@ -1267,11 +1271,14 @@ def print_results(r):
             print(f"    仅 gz_init 引用, 主循环无硬依赖")
     elif rename is False:
         print(f" 不可行")
+        if blocked_by_hoa:
+            print(f"    halt_on_assert 被无条件置 1, 重名触发 assert_fatal → WDT reset")
         if gz_refs >= 2:
             print(f"    \"gz\" {gz_refs} 处代码引用 ({', '.join(gz_details)})")
         if main_boot_gz is True:
             print(f"    主引导函数 ({boot_area}) 包含 gz 分区名引用")
-        print(f"    主引导循环依赖 gz 名称解析, 重名导致引导流水线中断")
+        if not blocked_by_hoa:
+            print(f"    主引导循环依赖 gz 名称解析, 重名导致引导流水线中断")
     else:
         print(f" 未知 (未找到 \"gz\" 引用或使用内联构造)")
 
