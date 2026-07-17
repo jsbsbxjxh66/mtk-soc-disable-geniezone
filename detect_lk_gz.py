@@ -13,7 +13,7 @@ GZ 初始化管线 (bl2_ext, 如 MT6991):
 
 VCP 修复 (解决 IOMMU protect pgtable 缺失导致的 WDT 重启):
   python3 detect_lk_gz.py lk.img --patch-protpgd            # 推荐: 修复 SMMU 标志, 保留 VCP
-  python3 detect_lk_gz.py lk.img --patch-vcp               # 备用: 禁用 VCP
+  python3 detect_lk_gz.py lk.img --patch-vcp               # 备用: 禁用 VCP (vcp-support→0, status→fail)
 
 通用:
   python3 detect_lk_gz.py lk.img --dry-run                # 仅显示补丁内容
@@ -278,6 +278,7 @@ class LKAnalyzer:
         results = []
         node_stack = []
         i = struct_base
+        pending_vcp_support = {}
 
         while i < pos + dtb_size - 4:
             token = struct.unpack('>I', d[i:i + 4])[0]
@@ -299,15 +300,23 @@ class LKAnalyzer:
                 prop_len = struct.unpack('>I', d[i + 4:i + 8])[0]
                 name_off = struct.unpack('>I', d[i + 8:i + 12])[0]
                 prop_name = get_prop_name(name_off)
+                path = '/' + '/'.join(node_stack)
                 if prop_name == 'vcp-support' and prop_len == 4 and i + 16 <= len(d):
                     val = struct.unpack('>I', d[i + 12:i + 16])[0]
-                    path = '/' + '/'.join(node_stack)
-                    results.append({
+                    entry = {
                         'dtb_offset': dtb_offset,
                         'value_file_offset': i + 12,
                         'path': path,
                         'value': val,
-                    })
+                    }
+                    pending_vcp_support[path] = entry
+                    results.append(entry)
+                elif prop_name == 'status' and prop_len >= 4:
+                    status_str = d[i + 12:i + 12 + prop_len].rstrip(b'\x00').decode('ascii', errors='replace')
+                    if path in pending_vcp_support:
+                        pending_vcp_support[path]['status'] = status_str
+                        pending_vcp_support[path]['status_file_offset'] = i + 12
+                        pending_vcp_support[path]['status_len'] = prop_len
                 i += 12 + ((prop_len + 3) & ~3)
             elif token == 9:  # FDT_END
                 break
@@ -745,10 +754,11 @@ def print_results(r):
                 patchable_count += 1
             elif node['value'] == 0:
                 marker = '  <- 已禁用'
+            status = node.get('status', '?')
             print(f"    DTB@0x{node['dtb_offset']:06X} {node['path']}:"
-                  f" vcp-support={node['value']}{marker}")
+                  f" vcp-support={node['value']} status=\"{status}\"{marker}")
         if patchable_count > 0:
-            print(f"\n  可禁用 VCP 节点: {patchable_count} 个 (vcp-support=1 -> 0)")
+            print(f"\n  可禁用 VCP 节点: {patchable_count} 个 (vcp-support=1->0, status=\"okay\"->\"fail\")")
 
     v2 = r.get('gz_init_v2')
     print(f"\n{'=' * 60}")
@@ -925,11 +935,17 @@ def do_patch(analyzer, results, output_path,
                 off = node['value_file_offset']
                 old_bytes = analyzer.data[off:off + 4]
                 print(f"  DTB@0x{node['dtb_offset']:06X} {node['path']}:")
-                print(f"    偏移: 0x{off:06X}")
-                print(f"    原始: {old_bytes.hex()}  (vcp-support=1)")
-                print(f"    补丁: 00000000  (vcp-support=0)")
+                print(f"    vcp-support: 0x{off:06X}  {old_bytes.hex()} -> 00000000")
                 struct.pack_into('>I', patched, off, 0)
                 any_applied = True
+                st_off = node.get('status_file_offset')
+                st_val = node.get('status', '')
+                st_len = node.get('status_len', 0)
+                if st_off is not None and st_val == 'okay' and st_len >= 5:
+                    old_st = analyzer.data[st_off:st_off + st_len]
+                    new_st = b'fail\x00' + b'\x00' * (st_len - 5)
+                    print(f"    status:      0x{st_off:06X}  \"{st_val}\" -> \"fail\"")
+                    patched[st_off:st_off + st_len] = new_st
 
     if not any_applied:
         return False
@@ -964,7 +980,7 @@ GZ 初始化管线 (bl2_ext):
 
 VCP 修复 (跳过 GZ 后保持 VCP/视频编解码正常):
   --patch-protpgd     修复 SMMU protpgd 标志 (推荐, 保留 VCP 功能)
-  --patch-vcp         禁用 VCP (备用, 视频硬件编解码不可用)
+  --patch-vcp         禁用 VCP (vcp-support→0, status→fail, 视频硬件编解码不可用)
 
 先运行不带参数的分析, 脚本会自动检测并显示可用方案。
 配合已解锁的 bootloader 或签名绕过工具使用。
@@ -978,7 +994,7 @@ VCP 修复 (跳过 GZ 后保持 VCP/视频编解码正常):
     parser.add_argument('--patch-protpgd', action='store_true',
                         help='修复 SMMU protpgd 标志 (保留 VCP 功能)')
     parser.add_argument('--patch-vcp', action='store_true',
-                        help='禁用 VCP (DTB vcp-support=1 -> 0)')
+                        help='禁用 VCP (vcp-support=1->0, status=okay->fail)')
     parser.add_argument('--dry-run', action='store_true', help='仅预览补丁, 不修改')
     parser.add_argument('--restore', action='store_true', help='从备份还原')
     args = parser.parse_args()

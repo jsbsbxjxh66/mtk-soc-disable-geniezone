@@ -32,7 +32,7 @@
   - **方案 B** (`--patch-init-fail`)：强制 `gz_init_main` 跳转到错误清理路径，触发 `gz_mblock_free_all` 释放内存
 - VCP 修复/禁用（MT6895 等）— 使用 GPT 方案跳过 GZ 后，VCP 子系统因 IOMMU 保护页表缺失而导致看门狗超时重启：
   - **VCP 修复** (`--patch-protpgd`，推荐）：修复 bl2_ext 中的 SMMU 标志位，使 bl2_ext 自行创建 protpgd mblock。ATF 能找到 IOMMU 保护页表 → VCP 正常工作，视频硬件编解码不受影响
-  - **VCP 禁用** (`--patch-vcp`，备用）：将 LK DTB 中所有 `vcp-support=1` 修改为 0，LK 不再加载 VCP，避免 IOMMU 超时。视频硬件编解码不可用
+  - **VCP 禁用** (`--patch-vcp`，备用）：将 LK DTB 中所有主 VCP 节点的 `vcp-support=1` 改为 0，同时将 `status="okay"` 改为 `"fail"`，LK 不再加载 VCP 固件，内核 VCP 驱动不 probe，避免 IOMMU 超时。视频硬件编解码不可用
 - 脚本自动检测 LK 中的 bl2_ext GZ 初始化管线和 DTB VCP 节点
 - 部分平台 GPT 方案不可用（如 MT6895 的 `halt_on_assert` 被强制置 1），此时需要 LK 方案
 - 部分平台使用 GPT 方案跳过 GZ 后需处理 VCP 问题：GZ 负责设置 IOMMU 保护页表（protpgd），跳过 GZ 后 VCP 初始化 SMC 调用失败 → 60 秒看门狗超时重启。推荐使用 `--patch-protpgd` 修复（保留 VCP 功能），或使用 `--patch-vcp` 禁用 VCP
@@ -179,7 +179,7 @@ python3 detect_lk_gz.py lk.img --patch-protpgd
 VCP 禁用（`--patch-vcp`，备用）：
 
 ```bash
-# 禁用 DTB 中的 VCP (vcp-support=1 → 0)
+# 禁用 DTB 中的 VCP (vcp-support=1→0, status="okay"→"fail")
 # 仅在 --patch-protpgd 不可用时使用
 python3 detect_lk_gz.py lk.img --patch-vcp
 ```
@@ -343,7 +343,7 @@ sh dump_pgpt.sh read         # 提取 PGPT
 3. **GZ 代码检测** — 搜索 `pl_boottags_gz_*_hook`、`[GZ_INIT]` 等特征字符串
 4. **bl2_ext 管线检测** — 在 bl2_ext 段搜索 `[GZ_INIT] init success/failed` 字符串，回溯 ADRP+ADD 引用定位 `gz_init_main`、`gz_config_validate`、错误清理路径
 5. **SMMU protpgd 检测** — 在 bl2_ext 段搜索 `platform_mtksmmu_protpgd` 字符串，通过 ADRP+ADD 引用（支持编译器 gap 优化）追踪到 `mtk_smmu_bl2_ext_init` 函数，定位 guard 函数，提取标志位偏移和当前值
-6. **DTB VCP 检测** — 扫描所有 FDT blob，解析设备树节点，定位 `vcp-support` 属性及其值
+6. **DTB VCP 检测** — 扫描所有 FDT blob，解析设备树节点，定位主 VCP 节点的 `vcp-support` 和 `status` 属性及其值
 
 ### 用法
 
@@ -363,7 +363,7 @@ python3 detect_lk_gz.py lk.img --patch-init-fail
 # 修复 SMMU protpgd 标志（推荐，保留 VCP）
 python3 detect_lk_gz.py lk.img --patch-protpgd
 
-# 禁用 VCP (DTB vcp-support=1 → 0，备用)
+# 禁用 VCP (DTB vcp-support=1→0, status="okay"→"fail"，备用)
 python3 detect_lk_gz.py lk.img --patch-vcp
 
 # 从备份还原
@@ -483,12 +483,15 @@ guard 函数:
 
 #### 备用方案：VCP 禁用 (`--patch-vcp`)
 
-修改 LK 内嵌 DTB 中的 `vcp-support` 属性，完全禁用 VCP：
+修改 LK 内嵌 DTB 中主 VCP 节点（`vcp@1ec00000`）的两个属性，完全禁用 VCP：
 
 - 扫描 LK 镜像中所有 FDT blob（通过 FDT magic `0xD00DFEED`）
-- 定位 `vcp@*` 节点下的 `vcp-support` 属性
-- 将 `vcp-support = <0x01>` 修改为 `<0x00>`
-- LK 的 `app_load_vcp()` 读取 DTB：值为 0 时不加载 VCP
+- 定位 `vcp@*` 节点下的 `vcp-support` 和 `status` 属性
+- 将 `vcp-support = <0x01>` 修改为 `<0x00>`：LK 的 `app_load_vcp()` 读取 DTB，值为 0 时不加载 VCP 固件
+- 将 `status = "okay"` 修改为 `"fail"`：内核 VCP 驱动不 probe，不发起 VCP SMC 调用
+- `vcp_iommu_*` 子节点无 `status` 属性，无需修改（主 VCP 禁用后子节点不会工作）
+
+> **注意**：`"fail"` 与 `"okay"` 同为 5 字节（含 \0），不改变 FDT 结构；`"disabled"` 为 9 字节，无法原地替换。`"fail"` 是设备树规范定义的标准状态值，内核 `of_device_is_available()` 对非 `"okay"` 的值一律返回 false，效果等同 `"disabled"`。
 
 > **注意**：VCP 禁用后，依赖 VCP 的功能（如硬件视频编解码加速、语音处理等）可能不可用或回退到软件实现。仅在 `--patch-protpgd` 不可用时使用。
 
@@ -517,8 +520,8 @@ guard 函数:
 | 字段 | 含义 |
 |------|------|
 | `DTB` | FDT blob 的文件偏移和大小 |
-| `VCP 节点` | vcp-support 属性的路径、值和文件偏移 |
-| `状态` | 已启用 / 已禁用 / 需补丁数量 |
+| `VCP 节点` | vcp-support 属性值、status 属性值、路径和文件偏移 |
+| `状态` | 已启用 / 已禁用 / 需补丁数量（vcp-support + status） |
 
 **通用：**
 
@@ -551,9 +554,9 @@ BROM → preloader (签名验证) → ATF → LK → kernel
 ```
 BROM → preloader (签名验证) → ATF → LK → kernel
               │                          │
-              ├─ gz_init(): 读取 gz 分区  ├─ app_load_vcp(): 读取 DTB vcp-support
-              │   配置 → 设置 NoGZ 标志   │   vcp-support=1 → 加载 VCP → SMC 初始化
-              ├─ 分区加载循环: 加载        │   vcp-support=0 → 跳过 VCP 加载
+              ├─ gz_init(): 读取 gz 分区  ├─ app_load_vcp(): 读取 DTB
+              │   配置 → 设置 NoGZ 标志   │   vcp-support=1 + status="okay" → 加载 VCP
+              ├─ 分区加载循环: 加载        │   vcp-support=0 或 status≠"okay" → 跳过
               │   tee/gz/scp 等分区镜像    │   (GZ 跳过时 IOMMU 保护页表缺失 →
               └─ ATF 跳转: 根据 NoGZ      │    VCP SMC 失败 → 60s WDT 超时)
                   决定是否将 EL2 移交给 GZ  └─ DTB: trusty-gz / nebula / vcp 节点 → kernel
