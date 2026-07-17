@@ -11,8 +11,9 @@ GZ 初始化管线 (bl2_ext, 如 MT6991):
   python3 detect_lk_gz.py lk.img --patch-validate          # 方案A: 跳过GZ初始化
   python3 detect_lk_gz.py lk.img --patch-init-fail         # 方案B: 强制初始化失败+释放内存
 
-VCP 禁用 (解决 IOMMU protect pgtable 缺失导致的 WDT 重启):
-  python3 detect_lk_gz.py lk.img --patch-vcp               # 禁用 VCP
+VCP 修复 (解决 IOMMU protect pgtable 缺失导致的 WDT 重启):
+  python3 detect_lk_gz.py lk.img --patch-protpgd            # 推荐: 修复 SMMU 标志, 保留 VCP
+  python3 detect_lk_gz.py lk.img --patch-vcp               # 备用: 禁用 VCP
 
 通用:
   python3 detect_lk_gz.py lk.img --dry-run                # 仅显示补丁内容
@@ -343,6 +344,30 @@ class LKAnalyzer:
                 return scan
         return None
 
+    def _bl2_find_adrp_add_refs_gapped(self, target_file_off, bl2_off, bl2_size,
+                                        max_gap=4):
+        """查找 ADRP+ADD 引用, 允许中间有 gap 指令 (编译器优化)."""
+        rel = target_file_off - bl2_off
+        page = rel & ~0xFFF
+        off_in_page = rel & 0xFFF
+        scan_limit = bl2_off + min(bl2_size, 0x100000) - 4
+        results = []
+        for scan in range(bl2_off, scan_limit, 4):
+            insn = struct.unpack_from('<I', self.data, scan)[0]
+            rd, adrp_page = a64_decode_adrp(insn, scan, bl2_off)
+            if rd is None or adrp_page != page:
+                continue
+            for gap in range(1, max_gap + 1):
+                add_off = scan + gap * 4
+                if add_off + 4 > len(self.data):
+                    break
+                add_insn = struct.unpack_from('<I', self.data, add_off)[0]
+                add_rd, add_rn, add_imm = a64_decode_add_imm(add_insn)
+                if add_rn == rd and add_imm == off_in_page:
+                    results.append(scan)
+                    break
+        return results
+
     def _find_bl2ext_gz_init(self):
         bl2_off = bl2_size = None
         for seg_off, seg_name, seg_size in self.segments:
@@ -470,6 +495,118 @@ class LKAnalyzer:
         }
 
     # ────────────────────────────────────────────────────
+    #  bl2_ext SMMU protpgd 标志检测
+    # ────────────────────────────────────────────────────
+
+    def _find_bl2ext_protpgd(self):
+        """检测 bl2_ext 中的 SMMU protect page table 标志位.
+
+        当 GZ 被跳过时, bl2_ext 可自行创建 protpgd mblock 供 ATF 使用,
+        但默认标志位为 1 (假定 GZ 管理 SMMU), 导致 bl2_ext 跳过分配.
+        补丁: 将标志位从 1 改为 0, 使 bl2_ext 创建 protpgd → VCP 正常工作.
+        """
+        bl2_off = bl2_size = None
+        for seg_off, seg_name, seg_size in self.segments:
+            if seg_name == 'bl2_ext':
+                bl2_off = seg_off + MTK_HDR_SIZE
+                bl2_size = seg_size
+                break
+        if bl2_off is None:
+            return None
+
+        d = self.data
+
+        str_off = d.find(b'platform_mtksmmu_protpgd', bl2_off,
+                         bl2_off + bl2_size)
+        if str_off < 0:
+            return None
+
+        refs = self._bl2_find_adrp_add_refs_gapped(
+            str_off, bl2_off, bl2_size)
+        if not refs:
+            return None
+
+        first_ref = min(refs)
+
+        prologue_off = None
+        for scan in range(first_ref - 4, max(bl2_off, first_ref - 200), -4):
+            insn = struct.unpack_from('<I', d, scan)[0]
+            if (insn & 0xFFC003FF) == 0xD10003FF:
+                prologue_off = scan
+                break
+            if (insn & 0xFFC07FFF) == 0xA9807BFD:
+                prologue_off = scan
+                break
+        if prologue_off is None:
+            return None
+
+        guard_bl_off = None
+        for scan in range(prologue_off, min(prologue_off + 48, first_ref), 4):
+            insn = struct.unpack_from('<I', d, scan)[0]
+            bl_target = a64_decode_bl(insn, scan)
+            if bl_target is not None and bl2_off <= bl_target < bl2_off + bl2_size:
+                guard_bl_off = scan
+                break
+        if guard_bl_off is None:
+            return None
+
+        guard_func_off = a64_decode_bl(
+            struct.unpack_from('<I', d, guard_bl_off)[0], guard_bl_off)
+
+        guard_insns = []
+        for i in range(8):
+            off = guard_func_off + i * 4
+            if off + 4 > len(d):
+                break
+            guard_insns.append(struct.unpack_from('<I', d, off)[0])
+            if guard_insns[-1] == 0xD65F03C0:
+                break
+
+        if len(guard_insns) < 4 or guard_insns[-1] != 0xD65F03C0:
+            return None
+
+        adrp_rd, adrp_page = a64_decode_adrp(
+            guard_insns[0], guard_func_off, bl2_off)
+        if adrp_rd is None:
+            return None
+
+        ldr_insn = guard_insns[1]
+        if (ldr_insn & 0xBFC00000) != 0xB9400000:
+            return None
+        ldr_rn = (ldr_insn >> 5) & 0x1F
+        if ldr_rn != adrp_rd:
+            return None
+        ldr_imm12 = (ldr_insn >> 10) & 0xFFF
+        ldr_sf = (ldr_insn >> 30) & 1
+        ldr_scale = 8 if ldr_sf else 4
+        ldr_offset = ldr_imm12 * ldr_scale
+
+        flag_code_off = adrp_page + ldr_offset
+        flag_file_off = bl2_off + flag_code_off
+        if flag_file_off + 4 > len(d):
+            return None
+
+        flag_value = struct.unpack_from('<I', d, flag_file_off)[0]
+
+        has_mvn = any(
+            (g & 0xFFE0FFE0) == 0x2A2003E0 for g in guard_insns[2:-1])
+        has_and1 = any(
+            (g & 0xFFFFFC00) == 0x12000000 for g in guard_insns[2:-1])
+        if not has_mvn or not has_and1:
+            return None
+
+        return {
+            'protpgd_string_off': str_off,
+            'code_refs': refs,
+            'func_off': prologue_off,
+            'guard_func_off': guard_func_off,
+            'flag_file_off': flag_file_off,
+            'flag_code_off': flag_code_off,
+            'flag_value': flag_value,
+            'already_patched': flag_value == 0,
+        }
+
+    # ────────────────────────────────────────────────────
     #  Main analysis
     # ────────────────────────────────────────────────────
 
@@ -520,6 +657,13 @@ class LKAnalyzer:
 
         # DTB VCP 节点
         r['vcp_nodes'] = self.find_dtb_vcp_nodes()
+
+        # bl2_ext SMMU protpgd 标志
+        r['protpgd_info'] = None
+        if self.arch == 'aarch64':
+            protpgd = self._find_bl2ext_protpgd()
+            if protpgd is not None:
+                r['protpgd_info'] = protpgd
 
         return r
 
@@ -651,19 +795,39 @@ def print_results(r):
     else:
         print(f"  此 LK 未包含 GenieZone 相关内容")
 
-    # ── VCP 补丁建议 ──
+    # ── SMMU protpgd 标志 ──
+    ppgd = r.get('protpgd_info')
+    if ppgd is not None:
+        print(f"\n  SMMU Protect Page Table (protpgd):")
+        print(f"    标志位偏移: 0x{ppgd['flag_file_off']:06X}"
+              f"  当前值: {ppgd['flag_value']}")
+        if ppgd['already_patched']:
+            print(f"    状态: 已补丁 (bl2_ext 将创建 protpgd mblock)")
+        else:
+            print(f"    含义: 值=1 -> bl2_ext 跳过 SMMU 初始化 (假定 GZ 管理)")
+            print(f"          跳过 GZ 时 protpgd 未创建 -> VCP SMC 失败 -> WDT 重启")
+
+    # ── VCP 解决方案 ──
     vcp_patchable = [n for n in vcp_nodes if n['value'] == 1]
-    if vcp_patchable:
+    if vcp_patchable or ppgd:
         script = os.path.basename(sys.argv[0])
-        print(f"\n  VCP 禁用: vcp-support=1 -> 0 (解决 IOMMU protect pgtable WDT 重启)")
-        print(f"    python3 {script} {r['file']} --patch-vcp")
+        print(f"\n  VCP 解决方案:")
+        if ppgd and not ppgd['already_patched']:
+            print(f"    推荐: --patch-protpgd  修复 SMMU 标志"
+                  f" (保留 VCP, 视频编解码正常)")
+            print(f"      python3 {script} {r['file']} --patch-protpgd")
+        if vcp_patchable:
+            label = "备用" if (ppgd and not ppgd['already_patched']) else "方案"
+            print(f"    {label}: --patch-vcp      禁用 VCP"
+                  f" (视频硬件编解码不可用)")
+            print(f"      python3 {script} {r['file']} --patch-vcp")
 
     print()
 
 
 def do_patch(analyzer, results, output_path,
              patch_validate=False, patch_init_fail=False, patch_vcp=False,
-             dry_run=False):
+             patch_protpgd=False, dry_run=False):
     patched = bytearray(analyzer.data)
     any_applied = False
 
@@ -715,6 +879,29 @@ def do_patch(analyzer, results, output_path,
             print(f"         -> 打印 \"init failed; gz is disabled from now on\"")
 
             struct.pack_into('<I', patched, bl_off, new_insn)
+            any_applied = True
+
+    # ── SMMU protpgd 标志补丁 ──
+
+    if patch_protpgd:
+        ppgd = results.get('protpgd_info')
+        if ppgd is None:
+            print("错误: 未在 bl2_ext 中找到 SMMU protpgd 标志, 无法应用")
+        elif ppgd['already_patched']:
+            print("protpgd: 标志已为 0, 跳过")
+        else:
+            off = ppgd['flag_file_off']
+            old_val = ppgd['flag_value']
+
+            print(f"\nSMMU protpgd 标志补丁 (bl2_ext 段):")
+            print(f"  目标: 0x{off:06X}")
+            print(f"  原始: {old_val:08X}  (bl2_ext 跳过 SMMU 初始化)")
+            print(f"  补丁: 00000000  (bl2_ext 创建 protpgd mblock)")
+            print(f"  效果: mtk_smmu_bl2_ext_init 分配 2MB protpgd 内存块")
+            print(f"         ATF mblock_query 成功 -> IOMMU protect pgtable 正常")
+            print(f"         VCP SMC 初始化成功 -> 视频硬件编解码正常工作")
+
+            struct.pack_into('<I', patched, off, 0)
             any_applied = True
 
     # ── VCP 禁用补丁 ──
@@ -775,8 +962,9 @@ GZ 初始化管线 (bl2_ext):
   --patch-validate    方案 A: gz_config_validate 返回 0, 跳过 GZ 初始化
   --patch-init-fail   方案 B: gz_init_main 强制失败, 触发内存释放清理
 
-VCP 禁用 (解决 Lab 法跳过 GZ 后 IOMMU protect pgtable 缺失导致的 WDT 重启):
-  --patch-vcp         禁用 VCP (DTB vcp-support=1 -> 0)
+VCP 修复 (跳过 GZ 后保持 VCP/视频编解码正常):
+  --patch-protpgd     修复 SMMU protpgd 标志 (推荐, 保留 VCP 功能)
+  --patch-vcp         禁用 VCP (备用, 视频硬件编解码不可用)
 
 先运行不带参数的分析, 脚本会自动检测并显示可用方案。
 配合已解锁的 bootloader 或签名绕过工具使用。
@@ -787,6 +975,8 @@ VCP 禁用 (解决 Lab 法跳过 GZ 后 IOMMU protect pgtable 缺失导致的 WD
                         help='方案 A: 跳过 GZ 初始化')
     parser.add_argument('--patch-init-fail', action='store_true',
                         help='方案 B: 强制 GZ 初始化失败 + 释放内存')
+    parser.add_argument('--patch-protpgd', action='store_true',
+                        help='修复 SMMU protpgd 标志 (保留 VCP 功能)')
     parser.add_argument('--patch-vcp', action='store_true',
                         help='禁用 VCP (DTB vcp-support=1 -> 0)')
     parser.add_argument('--dry-run', action='store_true', help='仅预览补丁, 不修改')
@@ -816,18 +1006,22 @@ VCP 禁用 (解决 Lab 法跳过 GZ 后 IOMMU protect pgtable 缺失导致的 WD
     results = analyzer.analyze()
     print_results(results)
 
-    want_patch = args.patch_validate or args.patch_init_fail or args.patch_vcp
+    want_patch = (args.patch_validate or args.patch_init_fail
+                  or args.patch_vcp or args.patch_protpgd)
     if want_patch or args.dry_run:
         v2 = results.get('gz_init_v2')
+        ppgd = results.get('protpgd_info')
 
         if args.dry_run and not want_patch:
             pv = v2 is not None and not v2.get('already_patched_validate')
             pi = v2 is not None and not v2.get('already_patched_init')
             pvcp = any(n['value'] == 1 for n in results.get('vcp_nodes', []))
+            pprot = ppgd is not None and not ppgd.get('already_patched')
         else:
             pv = args.patch_validate
             pi = args.patch_init_fail
             pvcp = args.patch_vcp
+            pprot = args.patch_protpgd
 
         can_new = v2 is not None
 
@@ -837,8 +1031,7 @@ VCP 禁用 (解决 Lab 法跳过 GZ 后 IOMMU protect pgtable 缺失导致的 WD
             print("错误: 未找到 bl2_ext GZ 初始化管线 (方案 B)")
         if pvcp and not any(n['value'] == 1 for n in results.get('vcp_nodes', [])):
             print("错误: 未在 DTB 中找到可禁用的 VCP 节点")
-
-        if not can_new and not pvcp and not args.dry_run:
+        if not can_new and not pvcp and not (pprot and ppgd) and not args.dry_run:
             sys.exit(1)
 
         if not args.dry_run and not os.path.isfile(backup_path):
@@ -847,7 +1040,7 @@ VCP 禁用 (解决 Lab 法跳过 GZ 后 IOMMU protect pgtable 缺失导致的 WD
 
         ok = do_patch(analyzer, results, output_path,
                       patch_validate=pv, patch_init_fail=pi, patch_vcp=pvcp,
-                      dry_run=args.dry_run)
+                      patch_protpgd=pprot, dry_run=args.dry_run)
         if not ok and not args.dry_run:
             sys.exit(1)
 

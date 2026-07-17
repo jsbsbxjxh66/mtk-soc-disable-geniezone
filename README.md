@@ -1,6 +1,6 @@
 # mtk-soc-disable-geniezone
 
-禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。LK 方案支持 bl2_ext GZ 初始化管线补丁和 DTB VCP 节点禁用。
+禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。LK 方案支持 bl2_ext GZ 初始化管线补丁、SMMU protpgd 标志修复和 DTB VCP 节点禁用。
 
 > **免责声明**
 >
@@ -11,8 +11,8 @@
 | 工具 | 用途 |
 |------|------|
 | `detect_gz_bypass.py` | 分析 preloader 固件，检测 GPT 修改方案是否可用，推荐无效 LBA 或重名子方案 |
-| `patch_gz_gpt.py` | 修改 GPT 分区表（PGPT + SGPT）：重名 gz→gx（`--rename`）或将 LBA 指向无效地址（默认） |
-| `detect_lk_gz.py` | 分析 LK 固件，检测并修补 bl2_ext GZ 初始化管线，支持 DTB VCP 节点禁用 |
+| `patch_gz_gpt.py` | 修改 GPT 分区表（PGPT）：重名 gz→gx（`--rename`）或将 LBA 指向无效地址（默认） |
+| `detect_lk_gz.py` | 分析 LK 固件，检测并修补 bl2_ext GZ 初始化管线，支持 SMMU protpgd 修复和 DTB VCP 禁用 |
 
 ## 两种方案
 
@@ -21,6 +21,7 @@
 | **GPT 重名方案** | Preloader | `halt_on_assert` 未强制置 1 且主引导循环无 gz 硬依赖 | 否 |
 | **GPT 无效 LBA 方案** | Preloader | `halt_on_assert` 未被强制置 1 | 否 |
 | **LK bl2_ext 方案** | LK (bl2_ext 段) | bl2_ext 中存在 GZ 初始化管线 | 是 |
+| **VCP 修复 (protpgd)** | LK (bl2_ext 数据段) | bl2_ext 中存在 SMMU protpgd 标志 | 是 |
 | **VCP 禁用** | LK (DTB) | LK 中 DTB 存在 vcp-support 节点 | 是 |
 
 - GPT 方案有两个子方案，均不修改代码：
@@ -29,11 +30,12 @@
 - LK bl2_ext 方案（MT6991 等）— GZ 逻辑在 bl2_ext 段，使用 Hafnium S-EL2 + GenieZone 架构：
   - **方案 A** (`--patch-validate`)：补丁 `gz_config_validate` 返回 0，跳过 GZ 初始化
   - **方案 B** (`--patch-init-fail`)：强制 `gz_init_main` 跳转到错误清理路径，触发 `gz_mblock_free_all` 释放内存
-- VCP 禁用（MT6895 等）— 使用 GPT 方案跳过 GZ 后，VCP 子系统因 IOMMU 保护页表缺失而导致看门狗超时重启：
-  - **VCP 禁用** (`--patch-vcp`)：将 LK DTB 中所有 `vcp-support=1` 修改为 0，LK 不再加载 VCP，避免 IOMMU 超时
+- VCP 修复/禁用（MT6895 等）— 使用 GPT 方案跳过 GZ 后，VCP 子系统因 IOMMU 保护页表缺失而导致看门狗超时重启：
+  - **VCP 修复** (`--patch-protpgd`，推荐）：修复 bl2_ext 中的 SMMU 标志位，使 bl2_ext 自行创建 protpgd mblock。ATF 能找到 IOMMU 保护页表 → VCP 正常工作，视频硬件编解码不受影响
+  - **VCP 禁用** (`--patch-vcp`，备用）：将 LK DTB 中所有 `vcp-support=1` 修改为 0，LK 不再加载 VCP，避免 IOMMU 超时。视频硬件编解码不可用
 - 脚本自动检测 LK 中的 bl2_ext GZ 初始化管线和 DTB VCP 节点
 - 部分平台 GPT 方案不可用（如 MT6895 的 `halt_on_assert` 被强制置 1），此时需要 LK 方案
-- 部分平台使用 GPT 方案跳过 GZ 后需配合 VCP 禁用：GZ 负责设置 IOMMU 保护页表，跳过 GZ 后 VCP 初始化 SMC 调用失败 → 60 秒看门狗超时重启。使用 `--patch-vcp` 禁用 VCP 可解决
+- 部分平台使用 GPT 方案跳过 GZ 后需处理 VCP 问题：GZ 负责设置 IOMMU 保护页表（protpgd），跳过 GZ 后 VCP 初始化 SMC 调用失败 → 60 秒看门狗超时重启。推荐使用 `--patch-protpgd` 修复（保留 VCP 功能），或使用 `--patch-vcp` 禁用 VCP
 - MT6991 等新式平台 GPT 方案不可用：preloader 不再负责加载 GZ，GZ 加载由 bl2_ext 执行。修改 GPT 后设备能进 fastboot，但无法正常启动——bl2_ext 的 `gz_init_main` 会在分区加载失败前执行不可逆的硬件配置（内存重映射、mblock 分配等），cleanup 无法完全逆转这些变更。需使用 LK bl2_ext 方案
 
 ## 快速开始
@@ -53,8 +55,8 @@ python3 detect_gz_bypass.py preloader.img
 ============================================================
   推荐: 无效 LBA 方案 (只需修改 PGPT)
   python3 patch_gz_gpt.py <pgpt.bin>
-  备选: 重名方案 (可能需同时修改 PGPT 和 SGPT)
-  python3 patch_gz_gpt.py --rename <pgpt.bin> --sgpt <sgpt.bin>
+  备选: 重名方案
+  python3 patch_gz_gpt.py --rename <pgpt.bin>
 
   * 以上结果仅供参考, 实际可行性因固件版本和设备而异
 ```
@@ -79,7 +81,7 @@ python3 detect_gz_bypass.py preloader.img
 
 #### 2. 修改分区表
 
-确认 GPT 方案可用后，提取设备的 `pgpt.bin`（和可选的 `sgpt.bin`）并修改：
+确认 GPT 方案可用后，提取设备的 `pgpt.bin` 并修改：
 
 ```bash
 # 分析分区表（不修改）
@@ -88,8 +90,8 @@ python3 patch_gz_gpt.py pgpt.bin --dry-run
 # 无效 LBA 方案（推荐，只需修改 PGPT）
 python3 patch_gz_gpt.py pgpt.bin
 
-# 重名方案（备选，可能需同时修改 PGPT 和 SGPT）
-python3 patch_gz_gpt.py pgpt.bin --rename --sgpt sgpt.bin
+# 重名方案（备选）
+python3 patch_gz_gpt.py pgpt.bin --rename
 
 # 指定输出文件名
 python3 patch_gz_gpt.py pgpt.bin -o my_output.bin
@@ -103,18 +105,17 @@ python3 patch_gz_gpt.py pgpt.bin -o my_output.bin
 
 # 或通过 fastboot
 fastboot flash pgpt pgpt_patched.bin
-fastboot flash sgpt sgpt_patched.bin   # 如果同时修改了 SGPT
+fastboot flash sgpt pgpt_patched.bin   # 同步刷写到备份 GPT（可选）
 ```
 
 #### 4. 还原
 
 ```bash
-# 使用脚本还原（同时还原 PGPT 和 SGPT）
-python3 patch_gz_gpt.py pgpt.bin --sgpt sgpt.bin --restore
+# 使用脚本还原
+python3 patch_gz_gpt.py pgpt.bin --restore
 
 # 或直接刷回备份
 fastboot flash pgpt pgpt_backup.bin
-fastboot flash sgpt sgpt_backup.bin
 ```
 
 ### 方案二：LK 方案
@@ -168,14 +169,19 @@ python3 detect_lk_gz.py lk.img --patch-init-fail
 python3 detect_lk_gz.py lk.img --patch-validate --patch-init-fail
 ```
 
-VCP 禁用（`--patch-vcp`）：
+VCP 修复（`--patch-protpgd`，推荐）：
+
+```bash
+# 修复 SMMU protpgd 标志，保留 VCP 功能（视频编解码正常）
+python3 detect_lk_gz.py lk.img --patch-protpgd
+```
+
+VCP 禁用（`--patch-vcp`，备用）：
 
 ```bash
 # 禁用 DTB 中的 VCP (vcp-support=1 → 0)
+# 仅在 --patch-protpgd 不可用时使用
 python3 detect_lk_gz.py lk.img --patch-vcp
-
-# 配合 bl2_ext 方案同时使用
-python3 detect_lk_gz.py lk.img --patch-validate --patch-vcp
 ```
 
 通用选项：
@@ -261,7 +267,7 @@ GPT 可用时，脚本进一步推荐子方案：
 | 不可行 | 无效 LBA 方案 | `patch_gz_gpt.py <pgpt.bin>` |
 | 未知 | 无效 LBA 方案 | `patch_gz_gpt.py <pgpt.bin>` |
 
-无效 LBA 方案只需修改 PGPT，重名方案可能需同时修改 PGPT 和 SGPT（`--sgpt`）。
+无效 LBA 方案和重名方案均修改 PGPT。部分设备可能需要将修改后的文件同时刷写到 SGPT 以确保一致性。
 
 **重名方案判定**：preloader 的 `gz_init` 加载 gz 分区时，找不到分区名会正常设置 NoGZ。但部分平台（如 MT6833）的主引导循环在 gz_init **之外**还独立调用 `name_resolver("gz")`，该调用失败导致整个引导流水线中断（跳过 LK 加载 → 无限循环）。脚本通过代码引用计数 + 主引导函数扫描双重检测来判定。
 
@@ -285,7 +291,7 @@ GPT 可用时，脚本进一步推荐子方案：
 
 ## patch_gz_gpt.py
 
-修改 GPT 分区表中的 gz 分区，支持 PGPT（主分区表）和 SGPT（备份分区表）同时修改，两种子方案：
+修改 GPT 分区表中的 gz 分区（PGPT 主分区表），两种子方案：
 
 - **重名方案** (`--rename`)：将 gz 分区名改为 gx，preloader 的 `get_part_info("gz")` 找不到分区 → 无 I/O → 设置 NoGZ
 - **无效 LBA 方案**（默认）：将 gz 分区 LBA 改为越界地址 (`total_lbas`)，存储 I/O 失败 → 设置 NoGZ
@@ -299,40 +305,36 @@ python3 patch_gz_gpt.py pgpt.bin --dry-run
 # 无效 LBA 方案（推荐，只需修改 PGPT）
 python3 patch_gz_gpt.py pgpt.bin
 
-# 重名方案（备选，可能需同时修改 PGPT 和 SGPT）
-python3 patch_gz_gpt.py pgpt.bin --rename --sgpt sgpt.bin
+# 重名方案（备选）
+python3 patch_gz_gpt.py pgpt.bin --rename
 
 # 指定输出文件
 python3 patch_gz_gpt.py pgpt.bin -o modified.bin
 
-# 从备份还原（同时还原 SGPT）
-python3 patch_gz_gpt.py pgpt.bin --sgpt sgpt.bin --restore
+# 从备份还原
+python3 patch_gz_gpt.py pgpt.bin --restore
 ```
 
 ### 特性
 
-- 支持同时修改 PGPT 和 SGPT（`--sgpt`），确保主备分区表一致
 - 自动检测扇区大小（512 字节 eMMC / 4096 字节 UFS）
-- 自动检测 SGPT 格式（GPT 头在文件末尾，分区条目在文件开头）
-- 自动备份原始文件（PGPT 和 SGPT 各自独立备份）
+- 自动备份原始文件
 - CRC32 校验自动更新（Header CRC + Entries CRC）
 - 支持 gz/gz1/gz2/gz_a/gz_b 等所有 A/B 分区命名
-- SGPT 中 gz 分区已被删除时自动跳过，不报错
 
-### 提取 pgpt.bin / sgpt.bin
+### 提取 pgpt.bin
 
-使用 mtkclient / geekflashtool / unlocktool 等工具从设备提取 `pgpt` 和 `sgpt` 分区。也可使用 `mtk-pgpt-tool/dump_pgpt.sh` 在已 root 设备上直接提取：
+使用 mtkclient / geekflashtool / unlocktool 等工具从设备提取 `pgpt` 分区。也可使用 `mtk-pgpt-tool/dump_pgpt.sh` 在已 root 设备上直接提取：
 
 ```bash
 sh dump_pgpt.sh read         # 提取 PGPT
-sh dump_pgpt.sh read-sgpt    # 提取 SGPT
 ```
 
 ---
 
 ## detect_lk_gz.py
 
-分析 LK (Little Kernel) 固件，检测 bl2_ext GZ 初始化管线并提供补丁。支持 DTB VCP 节点禁用。
+分析 LK (Little Kernel) 固件，检测 bl2_ext GZ 初始化管线并提供补丁。支持 SMMU protpgd 标志修复和 DTB VCP 节点禁用。
 
 ### 检测流程
 
@@ -340,7 +342,8 @@ sh dump_pgpt.sh read-sgpt    # 提取 SGPT
 2. **架构识别** — 支持 AArch64 和 ARM32（通过异常向量表/首指令特征自动识别）
 3. **GZ 代码检测** — 搜索 `pl_boottags_gz_*_hook`、`[GZ_INIT]` 等特征字符串
 4. **bl2_ext 管线检测** — 在 bl2_ext 段搜索 `[GZ_INIT] init success/failed` 字符串，回溯 ADRP+ADD 引用定位 `gz_init_main`、`gz_config_validate`、错误清理路径
-5. **DTB VCP 检测** — 扫描所有 FDT blob，解析设备树节点，定位 `vcp-support` 属性及其值
+5. **SMMU protpgd 检测** — 在 bl2_ext 段搜索 `platform_mtksmmu_protpgd` 字符串，通过 ADRP+ADD 引用（支持编译器 gap 优化）追踪到 `mtk_smmu_bl2_ext_init` 函数，定位 guard 函数，提取标志位偏移和当前值
+6. **DTB VCP 检测** — 扫描所有 FDT blob，解析设备树节点，定位 `vcp-support` 属性及其值
 
 ### 用法
 
@@ -357,7 +360,10 @@ python3 detect_lk_gz.py lk.img --patch-validate
 # 方案 B: gz_init_main 强制失败，释放 GZ 内存
 python3 detect_lk_gz.py lk.img --patch-init-fail
 
-# 禁用 VCP (DTB vcp-support=1 → 0)
+# 修复 SMMU protpgd 标志（推荐，保留 VCP）
+python3 detect_lk_gz.py lk.img --patch-protpgd
+
+# 禁用 VCP (DTB vcp-support=1 → 0，备用)
 python3 detect_lk_gz.py lk.img --patch-vcp
 
 # 从备份还原
@@ -438,36 +444,53 @@ cleanup_path:                  cleanup_path:
 
 > **注意**：方案 A 跳过了整个 `gz_init_main`，`gz_mblock_free_all` 可能不被调用。如果 preloader 已经为 GZ 预留了内存（通过 `gz-tee-static-shm` mblock），方案 A 不会释放这些内存。方案 B 的错误清理路径会显式调用 `gz_mblock_free_all`，因此推荐使用方案 B 或 A+B。
 
-### VCP 禁用（MT6895 等）
+### VCP 修复/禁用（MT6895 等）
 
 部分平台（如 MT6895）使用 GPT 方案跳过 GZ 后，设备会在开机约 60 秒后看门狗超时重启。根本原因：
 
 ```
 GZ 被跳过
-  → ATF 中 IOMMU 保护页表 (platform_mtksmmu_protpgd) 未被创建
-  → VCP 初始化时调用 vcp_smc_vcp_init SMC
-  → ATF 的 mtk_iommu_init_protect_pt_mem 查询 mblock 失败
-  → VCP IOVA 映射失败
+  → bl2_ext 中 SMMU 标志位 = 1 (假定 GZ 管理 SMMU)
+  → mtk_smmu_bl2_ext_init 跳过 protpgd mblock 分配
+  → ATF 的 mblock_query("platform_mtksmmu_protpgd") 失败
+  → VCP SMC 调用 vcp_smc_vcp_init → IOMMU 映射失败
   → 60 秒看门狗超时 → 强制重启
 ```
 
-`--patch-vcp` 通过修改 LK 内嵌 DTB 中的 `vcp-support` 属性来解决此问题：
+提供两种解决方案：
+
+#### 推荐方案：protpgd 修复 (`--patch-protpgd`)
+
+修复 bl2_ext 中的 SMMU 标志位，使 bl2_ext 自行创建 protpgd mblock。
+
+**原理**：bl2_ext 中的 `mtk_smmu_bl2_ext_init` 函数本身具备创建 protpgd mblock 的能力（分配 2MB 对齐内存），但函数入口有一个 guard 检查：读取数据段中的标志位，如果标志位为 1 则跳过分配（假定 GZ 已处理 SMMU）。该标志位在二进制中默认初始化为 1。
+
+补丁将标志位从 1 改为 0，guard 函数返回 1 → 继续执行 → 分配 protpgd mblock → ATF 的 `mblock_query` 成功 → VCP 正常工作。
+
+```
+guard 函数:
+  ADRP  X8, <data_page>
+  LDR   W8, [X8, #offset]      ; 读取标志位
+  MVN   W8, W8                  ; 取反
+  AND   W0, W8, #1              ; 返回 (~flag) & 1
+  RET
+
+标志位 = 1 (原始):  guard 返回 0 → CBZ 跳过 → protpgd 未创建 ✗
+标志位 = 0 (补丁后): guard 返回 1 → 继续执行 → protpgd 已创建 ✓
+```
+
+> **优势**：VCP 保持完整功能，视频硬件编解码正常工作。仅修改 1 字节数据。
+
+#### 备用方案：VCP 禁用 (`--patch-vcp`)
+
+修改 LK 内嵌 DTB 中的 `vcp-support` 属性，完全禁用 VCP：
 
 - 扫描 LK 镜像中所有 FDT blob（通过 FDT magic `0xD00DFEED`）
-- 解析每个 DTB 的节点树，定位 `vcp@*` 节点下的 `vcp-support` 属性
-- 将所有 `vcp-support = <0x01>`（已启用）修改为 `<0x00>`（已禁用）
-- LK 的 `app_load_vcp()` 读取 DTB 中的 `vcp-support`：值为 0 时直接返回，不加载 VCP
+- 定位 `vcp@*` 节点下的 `vcp-support` 属性
+- 将 `vcp-support = <0x01>` 修改为 `<0x00>`
+- LK 的 `app_load_vcp()` 读取 DTB：值为 0 时不加载 VCP
 
-```
-原始 DTB:                      补丁后:
-  vcp@1ec00000 {                 vcp@1ec00000 {
-    compatible = "mediatek,vcp";   compatible = "mediatek,vcp";
-    vcp-support = <0x01>;   ←      vcp-support = <0x00>;   ← 已禁用
-    status = "okay";               status = "okay";
-  };                             };
-```
-
-> **注意**：VCP 禁用后，依赖 VCP 的功能（如硬件视频编解码加速、语音处理等）可能不可用或回退到软件实现。
+> **注意**：VCP 禁用后，依赖 VCP 的功能（如硬件视频编解码加速、语音处理等）可能不可用或回退到软件实现。仅在 `--patch-protpgd` 不可用时使用。
 
 ### 输出字段说明
 
@@ -480,6 +503,14 @@ GZ 被跳过
 | `gz_init_main` | GZ 初始化主函数的文件偏移 |
 | `gz_config_validate` | 配置验证函数的文件偏移 |
 | `错误清理路径` | 错误处理入口的文件偏移（含 `gz_mblock_free_all`） |
+
+**SMMU protpgd：**
+
+| 字段 | 含义 |
+|------|------|
+| `标志位偏移` | SMMU guard 标志位在文件中的偏移 |
+| `当前值` | 0 = bl2_ext 自行创建 protpgd, 1 = 跳过（假定 GZ 管理） |
+| `状态` | 已补丁 / 需补丁 |
 
 **VCP 禁用：**
 
@@ -543,7 +574,7 @@ BROM → preloader (签名验证) → ATF → LK (bl2_ext) → LK (lk) → kerne
 ```
 
 - **GPT 方案**（MT6833/MT6893 等）：作用于 preloader 阶段，让 gz 分区 I/O 失败 → NoGZ → 跳过 GZ 加载。LK 无 GZ 代码，GPT 方案即可完全禁用
-- **GPT + VCP 禁用**（MT6895 等）：GPT 方案触发 NoGZ 跳过 GZ，但 VCP 因缺少 IOMMU 保护页表导致超时重启，需配合 `--patch-vcp` 禁用 VCP
+- **GPT + VCP 修复**（MT6895 等）：GPT 方案触发 NoGZ 跳过 GZ，但 VCP 因缺少 IOMMU 保护页表导致超时重启，需配合 `--patch-protpgd`（推荐，保留 VCP 功能）或 `--patch-vcp`（禁用 VCP）
 - **bl2_ext 方案 A**：补丁 gz_config_validate → 返回 0 → 跳过 bl2_ext 中的 GZ 初始化
 - **bl2_ext 方案 B**：补丁 gz_init_main → 强制走失败路径 → gz_mblock_free_all 释放内存
 
@@ -651,7 +682,11 @@ LK 方案修改了 LK 代码/数据，签名校验不通过。需要使用不校
 
 **GPT 方案跳过 GZ 后约 60 秒看门狗重启（MT6895 等）**
 
-GZ 被跳过后，ATF 中的 IOMMU 保护页表 (`platform_mtksmmu_protpgd`) 未被创建。VCP 初始化时调用 `vcp_smc_vcp_init` SMC → ATF 查询 mblock 失败 → VCP IOVA 映射失败 → 60 秒看门狗超时重启。使用 `--patch-vcp` 禁用 VCP 可解决。
+GZ 被跳过后，bl2_ext 中的 SMMU 标志位默认为 1（假定 GZ 管理 SMMU），`mtk_smmu_bl2_ext_init` 跳过 protpgd mblock 分配。内核启动后 VCP 驱动调用 `vcp_smc_vcp_init` SMC → ATF 查询 mblock 失败 → VCP IOVA 映射失败 → 60 秒看门狗超时重启。
+
+解决方案：
+- **推荐**：`--patch-protpgd` 修复 SMMU 标志位，bl2_ext 自行创建 protpgd → VCP 正常工作
+- **备用**：`--patch-vcp` 禁用 VCP（视频硬件编解码不可用）
 
 **补丁后仍未释放 GZ 内存**
 
@@ -688,11 +723,11 @@ GZ 被跳过后，ATF 中的 IOMMU 保护页表 (`platform_mtksmmu_protpgd`) 未
 - **UFS 崩溃**：部分 UFS 控制器在遇到越界 LBA 时会崩溃而非返回错误（GPT 方案）
 - **OTA 更新**：系统 OTA 可能还原 GPT / LK 到原始状态，需要重新修改
 - **可恢复性**：GPT 方案仅修改分区表，LK 方案自动备份原始固件，均可随时还原
-- **备份 GPT**：使用 `--sgpt` 同时修改 PGPT 和 SGPT，确保主备分区表一致。部分 preloader 在主 GPT 校验失败时会回退到备份 GPT，仅修改 PGPT 可能因 SGPT 中 gz 分区仍有效而导致方案失效
+- **备份 GPT**：当前工具仅修改 PGPT。部分 preloader 在主 GPT 校验失败时会回退到备份 GPT（SGPT），仅修改 PGPT 可能因 SGPT 中 gz 分区仍有效而导致方案失效
 - **LK 签名**：LK 方案修改了代码/数据，需要不校验签名的 preloader 或 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名
 - **处理器代际差异**：
   - 天玑 v5 及以下（如 MT6833/MT6893）：GPT LBA 方案通常直接可用，LK 无 GZ 代码不需要 LK 方案
-  - 天玑 v6（如 MT6895）：GPT 方案跳过 GZ 后需配合 `--patch-vcp` 禁用 VCP，否则 VCP IOMMU 超时导致 60 秒看门狗重启
+  - 天玑 v6（如 MT6895）：GPT 方案跳过 GZ 后需配合 `--patch-protpgd`（推荐）或 `--patch-vcp` 修复 VCP 问题，否则 VCP IOMMU 超时导致 60 秒看门狗重启
   - 天玑 v6+（如 MT6991）：GPT 方案不可用（修改 GPT 后能进 fastboot 但无法正常启动，bl2_ext 中 GZ 初始化的部分执行导致不可逆硬件配置变更），需使用 bl2_ext 方案（`--patch-validate` / `--patch-init-fail`）
   - 或使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 高级用法直接干掉 GenieZone
 - **功能影响**：禁用 GenieZone 后，依赖 GZ 虚拟化服务的功能（如部分 DRM、安全容器等）可能不可用；禁用 VCP 后，硬件视频编解码加速等功能可能不可用或回退到软件实现
