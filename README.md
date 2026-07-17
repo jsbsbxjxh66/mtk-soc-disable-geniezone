@@ -735,25 +735,108 @@ LK 补丁方案不存在此问题：
 
 UFS 控制器在 preloader 阶段读取越界 LBA 时崩溃（控制器 bug）。需要通过 mtkclient 或 SP Flash Tool 底层恢复刷回备份 GPT。
 
-### LK 方案
+### LK / bl2_ext 方案
 
 **签名验证失败，无法启动**
 
-LK 方案修改了 LK 代码/数据，签名校验不通过。需要使用不校验签名的 preloader 或 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名验证。
-
-**GPT 方案跳过 GZ 后约 60 秒看门狗重启（MT6895 等）**
-
-GZ 被跳过后，SMMU 保护页表（protpgd）虽然可能被分配，但页表项为空（正常由 GZ 填充）。ATF 的 `vcp_smc_vcp_init` 配置 SMMU 寄存器指向空页表 → VCP DMA 映射到 PA=0x0 → IOMMU translation fault → 60 秒看门狗超时重启。
-
-解决方案：
-- **推荐**：`patch_tee_vcp.py` 补丁 ATF 跳过 SMMU 保护设置 → VCP 正常工作（仅使用内核 IOMMU）
-- **备用**：`--patch-vcp` 禁用 VCP（视频硬件编解码不可用）
+LK 方案修改了 LK 代码/数据，签名校验不通过。需要使用不校验签名的 preloader 或 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名验证。ATF 补丁（`patch_tee_vcp.py`）同理，tee.img 也有签名校验。
 
 **补丁后仍未释放 GZ 内存**
 
 可能原因：
 1. **方案 A**：`--patch-validate` 跳过了 `gz_init_main`，`gz_mblock_free_all` 未被调用。如果 preloader 已通过 `gz-tee-static-shm` 预留了内存，这部分内存不会被释放 → 使用 `--patch-init-fail`（方案 B）或 A+B
 2. 内核层面的 trusty-gz / nebula 驱动仍在尝试初始化 GZ（通常会优雅失败，不影响启动）
+
+### VCP 崩溃（GPT 禁用 GZ 后约 60 秒看门狗重启）
+
+适用平台：MT6895 等使用 GPT 方案禁用 GZ 且 ATF 中有 VCP SMMU 保护逻辑的平台。
+
+#### 症状
+
+设备正常启动进入系统，但约 60 秒后突然重启。反复循环。内核日志（如能抓取）中可能看到：
+
+```
+mtk_iommu: iova 0x... pa 0x0 ...
+mtk_iommu: translation fault
+vcp: watchdog timeout
+```
+
+关键特征：
+- PA 地址为 **0x0**（空页表默认映射）
+- 故障来源为 VCP 相关的 IOMMU 端口
+- 重启间隔固定约 60 秒（VCP 看门狗超时时间）
+- 不禁用 GZ 时不会出现此问题
+
+#### 根因分析
+
+```
+正常流程 (GZ 启用):
+  bl2_ext 分配 protpgd mblock (2MB) → 全零
+  ATF 映射 protpgd 到 VA 空间
+  GZ 启动后填充 protpgd 页表项 (IOVA → PA 映射)     ← 关键步骤
+  内核启动 → VCP 驱动 → SMC vcp_smc_vcp_init
+  ATF 用 protpgd 中的映射配置 SMMU 保护寄存器
+  VCP DMA → SMMU 查 protpgd → 正确 PA → 正常工作 ✓
+
+异常流程 (GZ 禁用, 未打 ATF 补丁):
+  bl2_ext 分配 protpgd mblock (2MB) → 全零
+  ATF 映射 protpgd 到 VA 空间
+  GZ 未启动 → protpgd 页表项全为 0                   ← 根因
+  内核启动 → VCP 驱动 → SMC vcp_smc_vcp_init
+  ATF 用空 protpgd 配置 SMMU 保护寄存器 → 所有映射指向 PA=0x0
+  VCP DMA → SMMU 查 protpgd → PA=0x0 → translation fault
+  VCP 看门狗超时 → WDT reset → 循环重启 ✗
+
+修复后流程 (GZ 禁用, 已打 ATF 补丁):
+  ATF vcp_smc_vcp_init 被补丁:
+    跳过 SMMU 保护设置 (不读 protpgd)
+    零化保护寄存器 (STP XZR,XZR + skip path)
+    返回成功
+  VCP 仅使用内核 M4U IOMMU → 正常工作 ✓
+```
+
+#### 解决方案
+
+| 方案 | 工具 | 效果 | 适用场景 |
+|------|------|------|---------|
+| **ATF 补丁**（推荐） | `patch_tee_vcp.py tee.img` | 跳过 SMMU 保护，VCP 正常工作 | 有 tee.img 且能绕过签名 |
+| **VCP 禁用**（备用） | `detect_lk_gz.py lk.img --patch-vcp` | 完全禁用 VCP，无 IOMMU 调用 | ATF 补丁不可用时 |
+
+#### 诊断步骤
+
+1. **确认是 VCP 问题**：观察重启间隔。约 60 秒固定间隔 → 大概率是 VCP 看门狗。随机时间重启 → 可能是其他问题
+2. **抓日志**：如果能连接 adb，开机后立即运行 `adb logcat | grep -iE "iommu|vcp|translation|fault|watchdog"` 捕获关键日志
+3. **确认 GZ 已禁用**：`adb shell cat /proc/device-tree/chosen/atag,gz` 或搜索 dmesg 中的 `NoGZ` / `gz is disabled` 字样
+4. **检查 tee.img**：用 `patch_tee_vcp.py tee.img --dry-run` 确认能找到补丁点
+
+#### 常见问题
+
+**`patch_tee_vcp.py` 报 "pattern not found"**
+
+脚本未能在 tee.img 中找到 `vcp_smc_vcp_init` 的特征模式。可能原因：
+- tee.img 不是 ATF 镜像（如提取了错误的分区）
+- 该平台 ATF 中没有 VCP SMMU 保护逻辑（可能不需要此补丁）
+- 该平台 ATF 使用了不同的寄存器编号或指令序列（需要手动逆向分析）
+
+验证方法：用 `strings tee.img | grep vcp_smc` 检查是否包含函数名字符串
+
+**补丁后仍然 60 秒重启**
+
+1. 确认 tee.img 已正确刷入（对比文件大小和 md5）
+2. 确认签名验证已被绕过（否则补丁后的 tee.img 会被拒绝加载，设备可能回退到 ROM 中的原始 ATF）
+3. 确认 GPT 补丁仍然有效（OTA 可能还原了 GPT）
+4. 可能存在其他 IOMMU 保护问题（非 VCP 端口），需进一步分析日志
+
+**补丁后视频编解码异常**
+
+正常情况下不应出现。ATF 补丁只跳过 SMMU Stage 2 保护层，内核 M4U IOMMU（Stage 1）仍正常工作。如果出现异常：
+- 确认内核 IOMMU 驱动正常加载（`dmesg | grep mtk_iommu`）
+- 确认 VCP 固件已被 LK 加载（`dmesg | grep -i vcp`）
+- 如果是特定视频格式/分辨率失败，可能与 SMMU 保护无关
+
+**误用 `--patch-protpgd` 和 `patch_tee_vcp.py` 同时打补丁**
+
+两者互斥但同时使用不会导致崩溃。ATF 补丁跳过了 SMMU 保护设置，protpgd 是否被分配不影响结果（不会被访问）。只是 `--patch-protpgd` 变成了无用修改，浪费了 2MB 内存用于分配一个永远不会被使用的 mblock
 
 ---
 
