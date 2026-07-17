@@ -1,6 +1,6 @@
 # mtk-soc-disable-geniezone
 
-禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。LK 方案支持 bl2_ext GZ 初始化管线补丁、SMMU protpgd 标志修复和 DTB VCP 节点禁用。
+禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。LK 方案支持 bl2_ext GZ 初始化管线补丁和 DTB VCP 节点禁用。ATF 方案支持 VCP SMMU 保护跳过补丁。
 
 > **免责声明**
 >
@@ -12,7 +12,8 @@
 |------|------|
 | `detect_gz_bypass.py` | 分析 preloader 固件，检测 GPT 修改方案是否可用，推荐无效 LBA 或重名子方案 |
 | `patch_gz_gpt.py` | 修改 GPT 分区表（PGPT）：重名 gz→gx（`--rename`）或将 LBA 指向无效地址（默认） |
-| `detect_lk_gz.py` | 分析 LK 固件，检测并修补 bl2_ext GZ 初始化管线，支持 SMMU protpgd 修复和 DTB VCP 禁用 |
+| `detect_lk_gz.py` | 分析 LK 固件，检测并修补 bl2_ext GZ 初始化管线，支持 DTB VCP 节点禁用 |
+| `patch_tee_vcp.py` | 补丁 ATF (tee.img)，跳过 VCP SMMU 保护设置，解决禁用 GZ 后 VCP 崩溃问题 |
 
 ## 两种方案
 
@@ -21,7 +22,7 @@
 | **GPT 重名方案** | Preloader | `halt_on_assert` 未强制置 1 且主引导循环无 gz 硬依赖 | 否 |
 | **GPT 无效 LBA 方案** | Preloader | `halt_on_assert` 未被强制置 1 | 否 |
 | **LK bl2_ext 方案** | LK (bl2_ext 段) | bl2_ext 中存在 GZ 初始化管线 | 是 |
-| **VCP 修复 (protpgd)** | LK (bl2_ext 数据段) | bl2_ext 中存在 SMMU protpgd 标志 | 是 |
+| **ATF VCP 修复** | ATF (tee.img) | ATF 中存在 vcp_smc_vcp_init 函数 | 是 |
 | **VCP 禁用** | LK (DTB) | LK 中 DTB 存在 vcp-support 节点 | 是 |
 
 - GPT 方案有两个子方案，均不修改代码：
@@ -30,12 +31,12 @@
 - LK bl2_ext 方案（MT6991 等）— GZ 逻辑在 bl2_ext 段，使用 Hafnium S-EL2 + GenieZone 架构：
   - **方案 A** (`--patch-validate`)：补丁 `gz_config_validate` 返回 0，跳过 GZ 初始化
   - **方案 B** (`--patch-init-fail`)：强制 `gz_init_main` 跳转到错误清理路径，触发 `gz_mblock_free_all` 释放内存
-- VCP 修复/禁用（MT6895 等）— 使用 GPT 方案跳过 GZ 后，VCP 子系统因 IOMMU 保护页表缺失而导致看门狗超时重启：
-  - **VCP 修复** (`--patch-protpgd`，推荐）：修复 bl2_ext 中的 SMMU 标志位，使 bl2_ext 自行创建 protpgd mblock。ATF 能找到 IOMMU 保护页表 → VCP 正常工作，视频硬件编解码不受影响
+- VCP 修复/禁用（MT6895 等）— 使用 GPT 方案跳过 GZ 后，VCP 子系统因 SMMU 保护页表为空而导致看门狗超时重启：
+  - **ATF VCP 修复** (`patch_tee_vcp.py`，推荐）：补丁 ATF 的 `vcp_smc_vcp_init`，跳过 SMMU 保护设置，零化保护寄存器后走已有的"跳过+成功"路径。VCP 仅使用内核 M4U IOMMU（正常工作），无需 SMMU 保护层。视频硬件编解码不受影响
   - **VCP 禁用** (`--patch-vcp`，备用）：将 LK DTB 中所有主 VCP 节点的 `vcp-support=1` 改为 0，同时将 `status="okay"` 改为 `"fail"`，LK 不再加载 VCP 固件，内核 VCP 驱动不 probe，避免 IOMMU 超时。视频硬件编解码不可用
 - 脚本自动检测 LK 中的 bl2_ext GZ 初始化管线和 DTB VCP 节点
-- 部分平台 GPT 方案不可用（如 MT6895 的 `halt_on_assert` 被强制置 1），此时需要 LK 方案
-- 部分平台使用 GPT 方案跳过 GZ 后需处理 VCP 问题：GZ 负责设置 IOMMU 保护页表（protpgd），跳过 GZ 后 VCP 初始化 SMC 调用失败 → 60 秒看门狗超时重启。推荐使用 `--patch-protpgd` 修复（保留 VCP 功能），或使用 `--patch-vcp` 禁用 VCP
+- 部分平台 GPT 方案不可用（如 `halt_on_assert` 被强制置 1 的平台），此时需要 LK 方案
+- 部分平台使用 GPT 方案跳过 GZ 后需处理 VCP 问题：GZ 负责填充 SMMU 保护页表（protpgd）的页表项，跳过 GZ 后页表为空，VCP DMA 映射到 PA=0x0 触发 IOMMU translation fault → 60 秒看门狗超时重启。推荐使用 `patch_tee_vcp.py` 补丁 ATF 跳过 SMMU 保护（保留 VCP 功能），或使用 `--patch-vcp` 禁用 VCP
 - MT6991 等新式平台 GPT 方案不可用：preloader 不再负责加载 GZ，GZ 加载由 bl2_ext 执行。修改 GPT 后设备能进 fastboot，但无法正常启动——bl2_ext 的 `gz_init_main` 会在分区加载失败前执行不可逆的硬件配置（内存重映射、mblock 分配等），cleanup 无法完全逆转这些变更。需使用 LK bl2_ext 方案
 
 ## 快速开始
@@ -169,20 +170,31 @@ python3 detect_lk_gz.py lk.img --patch-init-fail
 python3 detect_lk_gz.py lk.img --patch-validate --patch-init-fail
 ```
 
-VCP 修复（`--patch-protpgd`，推荐）：
-
-```bash
-# 修复 SMMU protpgd 标志，保留 VCP 功能（视频编解码正常）
-python3 detect_lk_gz.py lk.img --patch-protpgd
-```
-
-VCP 禁用（`--patch-vcp`，备用）：
+VCP 禁用（`--patch-vcp`，仅在 ATF 补丁不可用时使用）：
 
 ```bash
 # 禁用 DTB 中的 VCP (vcp-support=1→0, status="okay"→"fail")
-# 仅在 --patch-protpgd 不可用时使用
 python3 detect_lk_gz.py lk.img --patch-vcp
 ```
+
+### 方案三：ATF VCP 修复（配合 GPT 方案使用）
+
+适用于 GPT 方案跳过 GZ 后 VCP 崩溃的平台（如 MT6895）。补丁 tee.img 跳过 SMMU 保护设置。
+
+**前提条件**：与 LK 方案相同，需要绕过签名验证。
+
+```bash
+# 分析 tee.img（不修改）
+python3 patch_tee_vcp.py tee.img --dry-run
+
+# 应用补丁
+python3 patch_tee_vcp.py tee.img -o tee_patched.img
+
+# 检测是否已打补丁
+python3 patch_tee_vcp.py tee_patched.img --dry-run
+```
+
+> **注意**：此补丁与 `--patch-protpgd` 互斥，不要同时使用。使用此补丁后 protpgd mblock 不再需要。
 
 通用选项：
 
@@ -334,7 +346,7 @@ sh dump_pgpt.sh read         # 提取 PGPT
 
 ## detect_lk_gz.py
 
-分析 LK (Little Kernel) 固件，检测 bl2_ext GZ 初始化管线并提供补丁。支持 SMMU protpgd 标志修复和 DTB VCP 节点禁用。
+分析 LK (Little Kernel) 固件，检测 bl2_ext GZ 初始化管线并提供补丁。支持 DTB VCP 节点禁用。
 
 ### 检测流程
 
@@ -342,8 +354,7 @@ sh dump_pgpt.sh read         # 提取 PGPT
 2. **架构识别** — 支持 AArch64 和 ARM32（通过异常向量表/首指令特征自动识别）
 3. **GZ 代码检测** — 搜索 `pl_boottags_gz_*_hook`、`[GZ_INIT]` 等特征字符串
 4. **bl2_ext 管线检测** — 在 bl2_ext 段搜索 `[GZ_INIT] init success/failed` 字符串，回溯 ADRP+ADD 引用定位 `gz_init_main`、`gz_config_validate`、错误清理路径
-5. **SMMU protpgd 检测** — 在 bl2_ext 段搜索 `platform_mtksmmu_protpgd` 字符串，通过 ADRP+ADD 引用（支持编译器 gap 优化）追踪到 `mtk_smmu_bl2_ext_init` 函数，定位 guard 函数，提取标志位偏移和当前值
-6. **DTB VCP 检测** — 扫描所有 FDT blob，解析设备树节点，定位主 VCP 节点的 `vcp-support` 和 `status` 属性及其值
+5. **DTB VCP 检测** — 扫描所有 FDT blob，解析设备树节点，定位主 VCP 节点的 `vcp-support` 和 `status` 属性及其值
 
 ### 用法
 
@@ -360,10 +371,8 @@ python3 detect_lk_gz.py lk.img --patch-validate
 # 方案 B: gz_init_main 强制失败，释放 GZ 内存
 python3 detect_lk_gz.py lk.img --patch-init-fail
 
-# 修复 SMMU protpgd 标志（推荐，保留 VCP）
-python3 detect_lk_gz.py lk.img --patch-protpgd
-
-# 禁用 VCP (DTB vcp-support=1→0, status="okay"→"fail"，备用)
+# 禁用 VCP (DTB vcp-support=1→0, status="okay"→"fail")
+# 仅在 patch_tee_vcp.py ATF 补丁不可用时使用
 python3 detect_lk_gz.py lk.img --patch-vcp
 
 # 从备份还原
@@ -450,36 +459,41 @@ cleanup_path:                  cleanup_path:
 
 ```
 GZ 被跳过
-  → bl2_ext 中 SMMU 标志位 = 1 (假定 GZ 管理 SMMU)
-  → mtk_smmu_bl2_ext_init 跳过 protpgd mblock 分配
-  → ATF 的 mblock_query("platform_mtksmmu_protpgd") 失败
-  → VCP SMC 调用 vcp_smc_vcp_init → IOMMU 映射失败
-  → 60 秒看门狗超时 → 强制重启
+  → SMMU 保护页表 (protpgd) 虽然分配了但页表项为空 (GZ 负责填充)
+  → ATF 的 vcp_smc_vcp_init 配置 SMMU 寄存器指向空页表
+  → VCP DMA 映射到 PA=0x0 (空页表默认映射)
+  → IOMMU translation fault → 无限 WDT 重启循环
 ```
 
 提供两种解决方案：
 
-#### 推荐方案：protpgd 修复 (`--patch-protpgd`)
+#### 推荐方案：ATF VCP 补丁 (`patch_tee_vcp.py`)
 
-修复 bl2_ext 中的 SMMU 标志位，使 bl2_ext 自行创建 protpgd mblock。
+补丁 ATF 的 `vcp_smc_vcp_init` 函数，跳过 SMMU 保护设置，使用已有的"跳过+成功"代码路径。
 
-**原理**：bl2_ext 中的 `mtk_smmu_bl2_ext_init` 函数本身具备创建 protpgd mblock 的能力（分配 2MB 对齐内存），但函数入口有一个 guard 检查：读取数据段中的标志位，如果标志位为 1 则跳过分配（假定 GZ 已处理 SMMU）。该标志位在二进制中默认初始化为 1。
+**原理**：ATF 中 `vcp_smc_vcp_init` 在配置 VCP 时会调用 SMMU 保护设置函数（BL 0x013BA0），该函数查找 protpgd 中的端口保护配置并填写 SMMU 寄存器。当 GZ 被禁用时，protpgd 页表为空，所有 IOVA→PA 映射指向 0x0，导致 translation fault。
 
-补丁将标志位从 1 改为 0，guard 函数返回 1 → 继续执行 → 分配 protpgd mblock → ATF 的 `mblock_query` 成功 → VCP 正常工作。
+函数本身已存在一条"跳过"路径（当某些参数为 0 时），该路径零化保护寄存器后返回成功。补丁将保护设置调用替换为直接跳转到此路径：
 
 ```
-guard 函数:
-  ADRP  X8, <data_page>
-  LDR   W8, [X8, #offset]      ; 读取标志位
-  MVN   W8, W8                  ; 取反
-  AND   W0, W8, #1              ; 返回 (~flag) & 1
-  RET
+原始代码:                          补丁后:
+  MOVZ  W8, #0x38                   MOVZ  W8, #0x38
+  STR   W8, [X24, #0xC]             STR   W8, [X24, #0xC]
+  LDR   X0, [X25, #0x650]           STP   XZR, XZR, [X24, #-16]  ← 零化保护寄存器
+  LDR   X1, [X26, #0x658]           NOP
+  MOVZ  W3, #1                      NOP
+  MOV   W2, WZR                     NOP
+  BL    protection_setup             B     skip_path               ← 跳到零化+返回成功
 
-标志位 = 1 (原始):  guard 返回 0 → CBZ 跳过 → protpgd 未创建 ✗
-标志位 = 0 (补丁后): guard 返回 1 → 继续执行 → protpgd 已创建 ✓
+skip_path:                         skip_path:
+  STR   WZR, [X24, #0]              STR   WZR, [X24, #0]          (已有代码)
+  STUR  XZR, [X24, #4]              STUR  XZR, [X24, #4]
+  ... (cache flush, 返回成功)         ... (cache flush, 返回成功)
 ```
 
-> **优势**：VCP 保持完整功能，视频硬件编解码正常工作。仅修改 1 字节数据。
+> **优势**：VCP 保持完整功能，视频硬件编解码正常工作。仅使用内核 M4U IOMMU（无 SMMU 保护层，GZ 禁用时可接受）。脚本使用模式匹配定位补丁点，不依赖固定偏移，具备跨固件版本通用性。
+
+> **注意**：此补丁与 `--patch-protpgd` 互斥。使用此补丁后 protpgd mblock 不再被访问，无需通过 bl2_ext 分配。
 
 #### 备用方案：VCP 禁用 (`--patch-vcp`)
 
@@ -493,7 +507,7 @@ guard 函数:
 
 > **注意**：`"fail"` 与 `"okay"` 同为 5 字节（含 \0），不改变 FDT 结构；`"disabled"` 为 9 字节，无法原地替换。`"fail"` 是设备树规范定义的标准状态值，内核 `of_device_is_available()` 对非 `"okay"` 的值一律返回 false，效果等同 `"disabled"`。
 
-> **注意**：VCP 禁用后，依赖 VCP 的功能（如硬件视频编解码加速、语音处理等）可能不可用或回退到软件实现。仅在 `--patch-protpgd` 不可用时使用。
+> **注意**：VCP 禁用后，依赖 VCP 的功能（如硬件视频编解码加速、语音处理等）可能不可用或回退到软件实现。仅在 `patch_tee_vcp.py` ATF 补丁不可用时使用。
 
 ### 输出字段说明
 
@@ -506,14 +520,6 @@ guard 函数:
 | `gz_init_main` | GZ 初始化主函数的文件偏移 |
 | `gz_config_validate` | 配置验证函数的文件偏移 |
 | `错误清理路径` | 错误处理入口的文件偏移（含 `gz_mblock_free_all`） |
-
-**SMMU protpgd：**
-
-| 字段 | 含义 |
-|------|------|
-| `标志位偏移` | SMMU guard 标志位在文件中的偏移 |
-| `当前值` | 0 = bl2_ext 自行创建 protpgd, 1 = 跳过（假定 GZ 管理） |
-| `状态` | 已补丁 / 需补丁 |
 
 **VCP 禁用：**
 
@@ -529,6 +535,54 @@ guard 函数:
 |------|------|
 | `Boot Tag 钩子` | preloader 传递 GZ 配置的 boot tag 回调函数 |
 | `DTB GZ 节点` | 设备树中的 GZ 相关节点（trusty-gz / nebula 等） |
+
+---
+
+## patch_tee_vcp.py
+
+补丁 MTK ATF (tee.img)，跳过 `vcp_smc_vcp_init` 中的 SMMU 保护设置。适用于 GPT 方案禁用 GZ 后 VCP 因空 SMMU 保护页表崩溃的平台（如 MT6895）。
+
+### 检测流程
+
+1. **字符串定位** — 搜索 `vcp_smc_vcp_init` 字符串作为近距离参考
+2. **锚点匹配** — 在函数代码范围内查找 `MOVZ Wn, #0x38` + `STR Wn, [Xm, #0xC]`（VCP MMIO 寄存器写入），提取保护寄存器基址寄存器号
+3. **调用点定位** — 从锚点向前搜索 `MOVZ W3, #1; MOV W2, WZR; BL` 原始模式或 `STP XZR,XZR; NOP; NOP; NOP; B` 已补丁模式
+4. **跳过路径定位** — 搜索 `STR WZR, [Xm, #0]; STUR XZR, [Xm, #4]` 零化+返回成功路径
+
+### 用法
+
+```bash
+# 分析（不修改）
+python3 patch_tee_vcp.py tee.img --dry-run
+
+# 应用补丁
+python3 patch_tee_vcp.py tee.img -o tee_patched.img
+
+# 原地补丁（自动备份 .bak）
+python3 patch_tee_vcp.py tee.img
+
+# 检测已补丁状态
+python3 patch_tee_vcp.py tee_patched.img --dry-run
+```
+
+### 补丁内容
+
+5 条指令替换（20 字节），不改变文件大小：
+
+| 原始指令 | 补丁后 | 说明 |
+|---------|--------|------|
+| `LDR X0, [X25, #imm]` | `STP XZR, XZR, [Xn, #-16]` | 零化保护寄存器 (16 字节) |
+| `LDR X1, [X26, #imm]` | `NOP` | |
+| `MOVZ W3, #1` | `NOP` | |
+| `MOV W2, WZR` | `NOP` | |
+| `BL protection_setup` | `B skip_path` | 跳转到已有零化+成功路径 |
+
+### 注意事项
+
+- 此补丁与 `--patch-protpgd` 互斥，不要同时使用
+- 补丁后 VCP 仅使用内核 M4U IOMMU，不再有 SMMU 保护层（GZ 禁用时可接受）
+- 脚本使用模式匹配，不依赖固定文件偏移，具备跨固件版本通用性
+- 无法自动还原（原始 BL 目标地址不可恢复），需保留原始 tee.img
 
 ---
 
@@ -549,17 +603,21 @@ BROM → preloader (签名验证) → ATF → LK → kernel
                   决定是否将 EL2 移交给 GZ
 ```
 
-**v6 架构（MT6895 等，preloader 初始化 gz，LK 含 VCP）：**
+**v6 架构（MT6895 等，preloader 初始化 gz，LK 含 VCP，ATF 含 SMMU 保护）：**
 
 ```
 BROM → preloader (签名验证) → ATF → LK → kernel
-              │                          │
-              ├─ gz_init(): 读取 gz 分区  ├─ app_load_vcp(): 读取 DTB
-              │   配置 → 设置 NoGZ 标志   │   vcp-support=1 + status="okay" → 加载 VCP
-              ├─ 分区加载循环: 加载        │   vcp-support=0 或 status≠"okay" → 跳过
-              │   tee/gz/scp 等分区镜像    │   (GZ 跳过时 IOMMU 保护页表缺失 →
-              └─ ATF 跳转: 根据 NoGZ      │    VCP SMC 失败 → 60s WDT 超时)
-                  决定是否将 EL2 移交给 GZ  └─ DTB: trusty-gz / nebula / vcp 节点 → kernel
+              │                  │       │
+              ├─ gz_init():      │       ├─ app_load_vcp(): 读取 DTB
+              │  读取 gz 分区     │       │   vcp-support=1 + status="okay" → 加载 VCP
+              │  配置 NoGZ 标志   │       │   vcp-support=0 或 status≠"okay" → 跳过
+              ├─ 分区加载循环     │       └─ DTB: trusty-gz / nebula / vcp 节点 → kernel
+              └─ ATF 跳转        │
+                                 ├─ vcp_smc_vcp_init:
+                                 │   配置 SMMU 保护寄存器 (查找 protpgd 页表)
+                                 │   GZ 跳过时页表为空 → DMA PA=0x0 → fault
+                                 │   patch_tee_vcp.py: 跳过保护设置 → 走零化+成功路径
+                                 └─ VCP 仅使用内核 M4U IOMMU (正常工作)
 ```
 
 **v6 新式架构带 AVF（MT6991 等，bl2_ext 初始化 gz，Hafnium S-EL2）：**
@@ -577,7 +635,7 @@ BROM → preloader (签名验证) → ATF → LK (bl2_ext) → LK (lk) → kerne
 ```
 
 - **GPT 方案**（MT6833/MT6893 等）：作用于 preloader 阶段，让 gz 分区 I/O 失败 → NoGZ → 跳过 GZ 加载。LK 无 GZ 代码，GPT 方案即可完全禁用
-- **GPT + VCP 修复**（MT6895 等）：GPT 方案触发 NoGZ 跳过 GZ，但 VCP 因缺少 IOMMU 保护页表导致超时重启，需配合 `--patch-protpgd`（推荐，保留 VCP 功能）或 `--patch-vcp`（禁用 VCP）
+- **GPT + ATF VCP 修复**（MT6895 等）：GPT 方案触发 NoGZ 跳过 GZ，但 VCP 因 SMMU 保护页表为空导致超时重启，需配合 `patch_tee_vcp.py` 补丁 ATF（推荐，保留 VCP 功能）或 `--patch-vcp`（禁用 VCP）
 - **bl2_ext 方案 A**：补丁 gz_config_validate → 返回 0 → 跳过 bl2_ext 中的 GZ 初始化
 - **bl2_ext 方案 B**：补丁 gz_init_main → 强制走失败路径 → gz_mblock_free_all 释放内存
 
@@ -623,7 +681,7 @@ BROM → preloader (签名验证) → ATF → LK (bl2_ext) → LK (lk) → kerne
 
 ### halt_on_assert 与 GPT 方案的关系
 
-部分平台（如 MT6895、MT6983）的 preloader 会无条件将 `halt_on_assert` 置为 1。此时 `assert_fatal` 被触发后调用 WDT reset，设备直接重启进入 BROM 模式，而不是继续执行设置 NoGZ 的代码路径。
+部分平台的 preloader 会无条件将 `halt_on_assert` 置为 1。此时 `assert_fatal` 被触发后调用 WDT reset，设备直接重启进入 BROM 模式，而不是继续执行设置 NoGZ 的代码路径。
 
 `detect_gz_bypass.py` 的检测步骤：
 
@@ -685,10 +743,10 @@ LK 方案修改了 LK 代码/数据，签名校验不通过。需要使用不校
 
 **GPT 方案跳过 GZ 后约 60 秒看门狗重启（MT6895 等）**
 
-GZ 被跳过后，bl2_ext 中的 SMMU 标志位默认为 1（假定 GZ 管理 SMMU），`mtk_smmu_bl2_ext_init` 跳过 protpgd mblock 分配。内核启动后 VCP 驱动调用 `vcp_smc_vcp_init` SMC → ATF 查询 mblock 失败 → VCP IOVA 映射失败 → 60 秒看门狗超时重启。
+GZ 被跳过后，SMMU 保护页表（protpgd）虽然可能被分配，但页表项为空（正常由 GZ 填充）。ATF 的 `vcp_smc_vcp_init` 配置 SMMU 寄存器指向空页表 → VCP DMA 映射到 PA=0x0 → IOMMU translation fault → 60 秒看门狗超时重启。
 
 解决方案：
-- **推荐**：`--patch-protpgd` 修复 SMMU 标志位，bl2_ext 自行创建 protpgd → VCP 正常工作
+- **推荐**：`patch_tee_vcp.py` 补丁 ATF 跳过 SMMU 保护设置 → VCP 正常工作（仅使用内核 IOMMU）
 - **备用**：`--patch-vcp` 禁用 VCP（视频硬件编解码不可用）
 
 **补丁后仍未释放 GZ 内存**
@@ -730,7 +788,7 @@ GZ 被跳过后，bl2_ext 中的 SMMU 标志位默认为 1（假定 GZ 管理 SM
 - **LK 签名**：LK 方案修改了代码/数据，需要不校验签名的 preloader 或 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名
 - **处理器代际差异**：
   - 天玑 v5 及以下（如 MT6833/MT6893）：GPT LBA 方案通常直接可用，LK 无 GZ 代码不需要 LK 方案
-  - 天玑 v6（如 MT6895）：GPT 方案跳过 GZ 后需配合 `--patch-protpgd`（推荐）或 `--patch-vcp` 修复 VCP 问题，否则 VCP IOMMU 超时导致 60 秒看门狗重启
+  - 天玑 v6（如 MT6895）：GPT 方案跳过 GZ 后需配合 `patch_tee_vcp.py` 补丁 ATF（推荐）或 `--patch-vcp` 修复 VCP 问题，否则 VCP SMMU 保护页表为空导致 IOMMU translation fault → 60 秒看门狗重启
   - 天玑 v6+（如 MT6991）：GPT 方案不可用（修改 GPT 后能进 fastboot 但无法正常启动，bl2_ext 中 GZ 初始化的部分执行导致不可逆硬件配置变更），需使用 bl2_ext 方案（`--patch-validate` / `--patch-init-fail`）
   - 或使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 高级用法直接干掉 GenieZone
 - **功能影响**：禁用 GenieZone 后，依赖 GZ 虚拟化服务的功能（如部分 DRM、安全容器等）可能不可用；禁用 VCP 后，硬件视频编解码加速等功能可能不可用或回退到软件实现
