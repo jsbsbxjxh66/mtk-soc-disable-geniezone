@@ -18,9 +18,10 @@ Three-layer patch:
      function so ALL callers skip SMMU hardware configuration.
   2. VCP handler skip: patch vcp_smc_vcp_init to skip the protection call
      and jump to the existing "zero+succeed" path.
-  3. EMI MPU domain 7 access: patch EMI MPU SMC handlers to clear domain 7's
-     APC bits (positions [15:14]) before programming, granting VCP/APU full
-     access to all EMI MPU regions.
+  3. EMI MPU domain 7 access: patch emi_mpu_config function entry to clear
+     domain 7's APC bits (positions [15:14]) from the APC parameter, granting
+     VCP/APU full access to all EMI MPU regions. This covers ALL callers:
+     both ATF boot-time init (mpu_init chain) and runtime SMC handlers.
 
 Usage:
     python3 patch_tee_vcp.py tee.img -o tee_patched.img
@@ -39,9 +40,12 @@ import shutil
 
 MTK_IMG_HDR_SIZE = 0x200
 NOP = 0xD503201F
-# AND X2, X3, #0xFFFFFFFFFFFF3FFF -- clears bits [15:14] (domain 7 APC = "no protection")
-AND_X2_X3_CLR_D7 = 0x9270F462
-# Original MOV X2, X3
+# AND Xd, X2, #0xFFFFFFFFFFFF3FFF -- clears bits [15:14] (domain 7 APC = "no protection")
+# Base encoding for AND Xd, X2, #mask: 0x9270F440 | Rd
+AND_XD_X2_CLR_D7_BASE = 0x9270F440
+# MOV Xd, X2 base encoding: 0xAA0203E0 | Rd (for emi_mpu_config entry match)
+MOV_XD_X2_BASE = 0xAA0203E0
+# MOV X2, X3 -- SMC handler arg shift pattern (X2=APC from X3)
 MOV_X2_X3 = 0xAA0303E2
 
 
@@ -246,84 +250,90 @@ def find_vcp_anchor(data):
     return site
 
 
-def find_emi_mpu_sites(data):
+def find_emi_mpu_entry_patch(data):
     """
-    Find EMI MPU SMC handler sites where APC is passed to emi_mpu_config.
+    Find emi_mpu_config function entry and the MOV Xd, X2 that saves the APC
+    parameter to a callee-saved register. Patching this single instruction
+    covers ALL callers: both ATF boot-time init (mpu_init → sub_fce0) and
+    runtime SMC handlers.
 
-    Pattern: MOV X0,X1; MOV X1,X2; MOV X2,X3; B <target>
-    This is the SMC arg-shift before tail-calling emi_mpu_config.
-    We only patch sites whose B target is emi_mpu_config (identified by
-    multiple callers sharing the same target -- unique among these patterns).
-    We patch MOV X2,X3 → AND X2,X3,#~0xC000 to clear domain 7's APC bits.
+    Discovery:
+    1. Find MOV X0,X1; MOV X1,X2; *; B <target> patterns (SMC handler sites)
+    2. Group by B target; the target with >=2 callers is emi_mpu_config
+    3. At emi_mpu_config entry, find MOV Xd, X2 (Xd in X19-X28) in first 12 insns
+    4. Return patch: MOV Xd, X2 → AND Xd, X2, #0xFFFFFFFFFFFF3FFF
+
+    Returns (file_off, orig_word, patch_word) or None.
     """
     code_base = MTK_IMG_HDR_SIZE
     pattern = struct.pack('<III', 0xAA0103E0, 0xAA0203E1, MOV_X2_X3)
-    patched_pattern = struct.pack('<III', 0xAA0103E0, 0xAA0203E1, AND_X2_X3_CLR_D7)
 
-    # First pass: collect all matches and their B targets
-    candidates = []  # (mov_x2_x3_file_off, b_target_code_off, is_patched)
+    candidates = []
     pos = code_base
     while True:
         idx = data.find(pattern, pos)
-        idx_p = data.find(patched_pattern, pos)
-        found = None
-        is_patched = False
-        if idx >= 0 and (idx_p < 0 or idx <= idx_p):
-            found = idx
-        elif idx_p >= 0:
-            found = idx_p
-            is_patched = True
-        if found is None:
+        if idx < 0:
             break
-        b_off = found + 12
+        b_off = idx + 12
         if b_off + 4 <= len(data):
             w = read_u32(data, b_off)
             if (w & 0xFC000000) == 0x14000000:
-                co = b_off - code_base
                 imm = w & 0x3FFFFFF
                 if imm & 0x2000000:
                     imm -= 0x4000000
-                tgt = co + imm * 4
-                candidates.append((found + 8, tgt, is_patched))
-        pos = found + 4
+                b_foff = b_off + imm * 4
+                candidates.append((idx, b_foff))
+        pos = idx + 4
 
     if not candidates:
-        print("  [!] No EMI MPU handler sites found")
-        return []
+        print("  [!] No EMI MPU handler sites found (can't locate emi_mpu_config)")
+        return None
 
-    # Second pass: identify emi_mpu_config as the target with multiple callers
     from collections import Counter
-    tgt_counts = Counter(tgt for _, tgt, _ in candidates)
-    emi_mpu_config_tgt = tgt_counts.most_common(1)[0]
+    tgt_counts = Counter(tgt for _, tgt in candidates)
+    best_tgt, best_count = tgt_counts.most_common(1)[0]
 
-    if emi_mpu_config_tgt[1] < 2:
-        print("  [!] No shared emi_mpu_config target found among %d candidates" %
+    if best_count < 2:
+        print("  [!] No shared emi_mpu_config target among %d candidates" %
               len(candidates))
-        return []
+        return None
 
-    target_co = emi_mpu_config_tgt[0]
-    sites = []
-    for foff, tgt, patched in candidates:
-        if tgt == target_co:
-            sites.append((foff, patched))
-            state_str = " [already patched]" if patched else ""
-            print("  [+] EMI MPU APC pass at file 0x%06X → emi_mpu_config 0x%06X%s" %
-                  (foff, target_co, state_str))
+    print("  [+] emi_mpu_config at file 0x%06X (found via %d SMC handler B sites)" %
+          (best_tgt, best_count))
 
-    print("  [+] EMI MPU: %d site(s) targeting emi_mpu_config (filtered from %d candidates)" %
-          (len(sites), len(candidates)))
-    return sites
+    for i in range(12):
+        addr = best_tgt + i * 4
+        if addr + 4 > len(data):
+            break
+        w = read_u32(data, addr)
+        rd = w & 0x1F
+
+        if (w & 0xFFFFFFE0) == MOV_XD_X2_BASE and 19 <= rd <= 28:
+            patch_word = AND_XD_X2_CLR_D7_BASE | rd
+            print("  [+] MOV X%d, X2 at file 0x%06X (entry +%d)" % (rd, addr, i * 4))
+            return (addr, w, patch_word)
+
+        if (w & 0xFFFFFFE0) == AND_XD_X2_CLR_D7_BASE and 19 <= rd <= 28:
+            orig_word = MOV_XD_X2_BASE | rd
+            print("  [+] AND X%d, X2, #~0xC000 at file 0x%06X (entry +%d) [already patched]" %
+                  (rd, addr, i * 4))
+            return (addr, orig_word, w)
+
+    print("  [!] Could not find MOV Xd, X2 at emi_mpu_config entry")
+    return None
 
 
-def build_patches(data, site, emi_sites=None):
+def build_patches(data, site, emi_entry=None):
     """
     Build patch entries: list of (file_offset, original_4bytes, patched_4bytes, desc).
 
-    Two patch groups:
+    Three patch groups:
       A) Global: inside the protection function, NOP the SMMU programming BL
          so ALL callers skip actual SMMU hardware configuration.
       B) VCP handler: replace 5 instructions ending at the BL to skip the
          protection call entirely and jump to the zero+succeed path.
+      C) EMI MPU: patch emi_mpu_config entry MOV Xd,X2 → AND Xd,X2,#~0xC000
+         to clear domain 7 APC bits for ALL callers.
     """
     code_base = MTK_IMG_HDR_SIZE
     patches = []
@@ -374,12 +384,11 @@ def build_patches(data, site, emi_sites=None):
         patches.append((foff, orig_bytes, struct.pack('<I', patch_word), desc))
 
     # --- Group C: EMI MPU domain 7 access ---
-    if emi_sites:
-        for foff, already_patched in emi_sites:
-            orig_bytes = struct.pack('<I', MOV_X2_X3)
-            patch_bytes = struct.pack('<I', AND_X2_X3_CLR_D7)
-            patches.append((foff, orig_bytes, patch_bytes,
-                            "AND X2, X3, #~0xC000 (clear domain 7 APC bits)"))
+    if emi_entry is not None:
+        foff, orig_word, patch_word = emi_entry
+        rd = orig_word & 0x1F
+        patches.append((foff, struct.pack('<I', orig_word), struct.pack('<I', patch_word),
+                         "AND X%d, X2, #~0xC000 (clear domain 7 APC in emi_mpu_config)" % rd))
 
     return patches
 
@@ -474,8 +483,8 @@ Detection strategy (device-independent):
         print("[!] %s" % e)
         return 1
 
-    print("[*] Searching for EMI MPU handler sites...")
-    emi_sites = find_emi_mpu_sites(data)
+    print("[*] Searching for EMI MPU emi_mpu_config entry...")
+    emi_entry = find_emi_mpu_entry_patch(data)
 
     if site.is_patched:
         print()
@@ -489,7 +498,7 @@ Detection strategy (device-independent):
 
     print("[*] Building patch...")
     try:
-        patches = build_patches(data, site, emi_sites)
+        patches = build_patches(data, site, emi_entry)
     except RuntimeError as e:
         print("[!] %s" % e)
         return 1
@@ -498,7 +507,7 @@ Detection strategy (device-independent):
 
     print()
     has_global = site.prot_prog_bl_off is not None
-    has_emi = bool(emi_sites)
+    has_emi = emi_entry is not None
     n_layers = 1 + int(has_global) + int(has_emi)
     print("  Patch plan (%d instructions, %d layers):" % (len(patches), n_layers))
     print("  %-12s  %-10s  %-10s  %s" %
@@ -566,7 +575,8 @@ Detection strategy (device-independent):
         print("      → jumps to existing zero+succeed path")
         print("      → VCP init returns success without processing protpgd pointer")
         if has_emi:
-            print("    Layer 3 (EMI MPU): domain 7 APC bits cleared in SMC handlers")
+            print("    Layer 3 (EMI MPU): domain 7 APC bits cleared at emi_mpu_config entry")
+            print("      → covers ALL callers: ATF boot init AND runtime SMC handlers")
             print("      → VCP/APU (domain 7) gets full access to all EMI MPU regions")
             print("      → prevents 12K+ EMI MPU violation IRQ storm on PROT_SHARED")
         print()
