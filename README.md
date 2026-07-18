@@ -13,7 +13,7 @@
 | `detect_gz_bypass.py` | 分析 preloader 固件，检测 GPT 修改方案是否可用，推荐无效 LBA 或重名子方案 |
 | `patch_gz_gpt.py` | 修改 GPT 分区表（PGPT）：重名 gz→gx（`--rename`）或将 LBA 指向无效地址（默认） |
 | `detect_lk_gz.py` | 分析 LK 固件，检测并修补 bl2_ext GZ 初始化管线，支持 DTB VCP 节点禁用 |
-| `patch_tee_vcp.py` | 补丁 ATF (tee.img)，两层跳过 SMMU 保护设置，解决禁用 GZ 后 VCP 崩溃问题 |
+| `patch_tee_vcp.py` | 补丁 ATF (tee.img)，三层补丁：跳过 SMMU 保护设置 + EMI MPU 域7访问授权，解决禁用 GZ 后 VCP 崩溃和 EMI MPU 违规问题 |
 
 ## 两种方案
 
@@ -22,7 +22,7 @@
 | **GPT 重名方案** | Preloader | `halt_on_assert` 未强制置 1 且主引导循环无 gz 硬依赖 | 否 |
 | **GPT 无效 LBA 方案** | Preloader | `halt_on_assert` 未被强制置 1 | 否 |
 | **LK bl2_ext 方案** | LK (bl2_ext 段) | bl2_ext 中存在 GZ 初始化管线 | 是 |
-| **ATF VCP 修复** | ATF (tee.img) | ATF 中存在 vcp_smc_vcp_init 函数 | 是 |
+| **ATF VCP 修复** | ATF (tee.img) | ATF 中存在 vcp_smc_vcp_init 函数和 EMI MPU SMC handler | 是 |
 | **VCP 禁用** | LK (DTB) | LK 中 DTB 存在 vcp-support 节点 | 是 |
 
 - GPT 方案有两个子方案，均不修改代码：
@@ -31,12 +31,12 @@
 - LK bl2_ext 方案（MT6991 等）— GZ 逻辑在 bl2_ext 段，使用 Hafnium S-EL2 + GenieZone 架构：
   - **方案 A** (`--patch-validate`)：补丁 `gz_config_validate` 返回 0，跳过 GZ 初始化
   - **方案 B** (`--patch-init-fail`)：强制 `gz_init_main` 跳转到错误清理路径，触发 `gz_mblock_free_all` 释放内存
-- VCP 修复/禁用（MT6895 等）— 使用 GPT 方案跳过 GZ 后，VCP 子系统因 SMMU 保护页表为空而导致看门狗超时重启：
-  - **ATF VCP 修复** (`patch_tee_vcp.py`，推荐）：两层补丁 ATF。Layer 1 在 SMMU 保护函数内部跳过硬件编程（覆盖所有 5 个调用点：iommu_secure init/cmdq/display/VCP 等），Layer 2 在 `vcp_smc_vcp_init` 中跳过保护调用并走"零化+成功"路径。VCP 仅使用内核 M4U IOMMU（正常工作），无需 SMMU 保护层。视频硬件编解码不受影响
+- VCP 修复/禁用（MT6895 等）— 使用 GPT 方案跳过 GZ 后，VCP 子系统因 SMMU 保护页表为空而导致看门狗超时重启，以及 EMI MPU 域7访问违规洪泛：
+  - **ATF VCP 修复** (`patch_tee_vcp.py`，推荐）：三层补丁 ATF。Layer 1 在 SMMU 保护函数内部跳过硬件编程（覆盖所有 5 个调用点），Layer 2 在 `vcp_smc_vcp_init` 中跳过保护调用并走"零化+成功"路径，Layer 3 在 EMI MPU SMC handler 中清除域7（VCP/APU）的 APC 位，授予域7对所有 EMI MPU region 的访问权限。VCP 仅使用内核 M4U IOMMU（正常工作），无需 SMMU 保护层。视频硬件编解码不受影响
   - **VCP 禁用** (`--patch-vcp`，备用）：将 LK DTB 中所有主 VCP 节点的 `vcp-support=1` 改为 0，同时将 `status="okay"` 改为 `"fail"`，LK 不再加载 VCP 固件，内核 VCP 驱动不 probe，避免 IOMMU 超时。视频硬件编解码不可用
 - 脚本自动检测 LK 中的 bl2_ext GZ 初始化管线和 DTB VCP 节点
 - 部分平台 GPT 方案不可用（如 `halt_on_assert` 被强制置 1 的平台），此时需要 LK 方案
-- 部分平台使用 GPT 方案跳过 GZ 后需处理 VCP 问题：GZ 负责填充 SMMU 保护页表（protpgd）的页表项，跳过 GZ 后页表为空，VCP DMA 映射到 PA=0x0 触发 IOMMU translation fault → 60 秒看门狗超时重启。推荐使用 `patch_tee_vcp.py` 补丁 ATF 跳过 SMMU 保护（保留 VCP 功能），或使用 `--patch-vcp` 禁用 VCP
+- 部分平台使用 GPT 方案跳过 GZ 后需处理 VCP 问题：GZ 负责填充 SMMU 保护页表（protpgd）的页表项，跳过 GZ 后页表为空，VCP DMA 映射到 PA=0x0 触发 IOMMU translation fault → 60 秒看门狗超时重启。此外，EMI MPU 域7（VCP/APU）的访问权限由 GZ 配置，跳过 GZ 后域7无权访问某些 EMI region，导致 EMI MPU 违规洪泛（约启动后 40 秒触发）。推荐使用 `patch_tee_vcp.py` 三层补丁 ATF（跳过 SMMU 保护 + EMI MPU 域7授权，保留 VCP 功能），或使用 `--patch-vcp` 禁用 VCP
 - MT6991 等新式平台 GPT 方案不可用：preloader 不再负责加载 GZ，GZ 加载由 bl2_ext 执行。修改 GPT 后设备能进 fastboot，但无法正常启动——bl2_ext 的 `gz_init_main` 会在分区加载失败前执行不可逆的硬件配置（内存重映射、mblock 分配等），cleanup 无法完全逆转这些变更。需使用 LK bl2_ext 方案
 
 ## 快速开始
@@ -463,19 +463,26 @@ GZ 被跳过
   → ATF 的 vcp_smc_vcp_init 配置 SMMU 寄存器指向空页表
   → VCP DMA 映射到 PA=0x0 (空页表默认映射)
   → IOMMU translation fault → 无限 WDT 重启循环
+
+  同时:
+  → EMI MPU 域7 (VCP/APU) 的访问权限未被 GZ 配置
+  → 域7访问 PROT_SHARED 等 region 触发 EMI MPU 违规
+  → EMI MPU 违规洪泛 → 约 40 秒后系统崩溃
 ```
 
 提供两种解决方案：
 
 #### 推荐方案：ATF VCP 补丁 (`patch_tee_vcp.py`)
 
-两层补丁 ATF，彻底跳过 SMMU 保护设置。
+三层补丁 ATF，跳过 SMMU 保护设置并授权 EMI MPU 域7访问。
 
 **背景**：ATF 中有一个 SMMU 保护函数（如 0x013BA0），被 5 个不同的 SMC handler 调用（iommu_secure init W3=4、cmdq W3=2、display W3=0、W3=3、VCP W3=1）。该函数内部先做验证/查找（第 1 个 BL），再做 SMMU 硬件编程（第 2 个 BL）。当 GZ 被禁用时，protpgd 页表为空，任何一个调用点触发 SMMU 编程都会导致空页表被加载到硬件。
 
 内核的 `iommu_secure.ko` 在启动早期（~1.1s）就通过 site1-4 调用保护函数编程 SMMU，远早于 VCP 启动（~7.7s）。因此仅补丁 VCP handler（Layer 2）不够——SMMU 在 VCP 启动前就已被空页表配置。
 
-**两层补丁**：
+此外，EMI MPU（External Memory Interface Memory Protection Unit）的域7（VCP/APU）访问权限原本由 GZ 配置。跳过 GZ 后，域7对某些 EMI region（如 PROT_SHARED，region 10）无访问权限，导致 EMI MPU 违规洪泛，约启动后 40 秒触发系统崩溃。Layer 3 通过在 EMI MPU SMC handler 入口处清除 APC 寄存器中域7的保护位，授予域7对所有 region 的访问权限。
+
+**三层补丁**：
 
 ```
 Layer 1 (全局): 保护函数内部
@@ -492,11 +499,19 @@ Layer 2 (VCP handler): vcp_smc_vcp_init 内部
     BL    protection_func           B     skip_path               ← 跳到零化+返回成功
   效果:  VCP handler 完全不处理 protpgd 指针
          skip_path 零化保护寄存器 [X24,#0] 和 [X24,#4] 后返回成功
+
+Layer 3 (EMI MPU 域7授权): EMI MPU SMC handler 入口
+  原始:  MOV X2, X3             ; 传递 APC 值到 emi_mpu_config
+  补丁:  AND X2, X3, #0xFFFFFFFFFFFF3FFF  ; 清除 bits[15:14]（域7 APC 位）
+  效果:  域7（VCP/APU）对所有 EMI MPU region 的 APC 值变为 00（无保护）
+         对两个 EMI MPU SMC handler 均生效：
+         - MTK_SIP_BL_EMIMPU_CONTROL (0x82000415)
+         - MTK_SIP_TEE_EMI_MPU_CONTROL (0x82000048)
 ```
 
-Layer 1 单独即可阻止 SMMU 被空页表配置，Layer 2 进一步确保 VCP handler 不处理无效的 protpgd 数据。
+Layer 1 单独即可阻止 SMMU 被空页表配置，Layer 2 进一步确保 VCP handler 不处理无效的 protpgd 数据，Layer 3 消除 EMI MPU 对域7的访问限制。
 
-> **优势**：VCP 保持完整功能，视频硬件编解码正常工作。仅使用内核 M4U IOMMU（无 SMMU 保护层，GZ 禁用时可接受）。脚本使用模式匹配定位补丁点，不依赖固定偏移，具备跨固件版本通用性。
+> **优势**：VCP 保持完整功能，视频硬件编解码正常工作。仅使用内核 M4U IOMMU（无 SMMU 保护层，GZ 禁用时可接受）。EMI MPU 域7（VCP/APU）获得完整访问权限，无违规洪泛。脚本使用模式匹配定位补丁点，不依赖固定偏移，具备跨固件版本通用性。
 
 > **注意**：此补丁与 `--patch-protpgd` 互斥。使用此补丁后 protpgd mblock 不再被访问，无需通过 bl2_ext 分配。
 
@@ -545,7 +560,7 @@ Layer 1 单独即可阻止 SMMU 被空页表配置，Layer 2 进一步确保 VCP
 
 ## patch_tee_vcp.py
 
-两层补丁 MTK ATF (tee.img)，跳过 SMMU 保护设置。适用于 GPT 方案禁用 GZ 后 VCP 因空 SMMU 保护页表崩溃的平台（如 MT6895）。
+三层补丁 MTK ATF (tee.img)，跳过 SMMU 保护设置并授权 EMI MPU 域7访问。适用于 GPT 方案禁用 GZ 后 VCP 因空 SMMU 保护页表崩溃以及 EMI MPU 域7违规的平台（如 MT6895）。
 
 ### 检测流程
 
@@ -554,6 +569,7 @@ Layer 1 单独即可阻止 SMMU 被空页表配置，Layer 2 进一步确保 VCP
 3. **调用点定位** — 从锚点向前搜索 `MOVZ W3, #1; MOV W2, WZR; BL` 原始模式或 `NOP; NOP; NOP; NOP; B` 已补丁模式
 4. **跳过路径定位** — 搜索 `STR WZR, [Xm, #0]; STUR XZR, [Xm, #4]` 零化+返回成功路径
 5. **保护函数编程 BL 定位** — 从 VCP handler 的 BL 目标地址进入保护函数，找到第 2 个 BL（SMMU 硬件编程调用）
+6. **EMI MPU 站点定位** — 搜索 `MOV X0,X1; MOV X1,X2; MOV X2,X3; B target` 模式，按 B 目标地址分组，只补丁指向 `emi_mpu_config`（有多个调用者的目标）的站点
 
 ### 用法
 
@@ -573,7 +589,7 @@ python3 patch_tee_vcp.py tee_patched.img --dry-run
 
 ### 补丁内容
 
-6 条指令替换（24 字节），不改变文件大小：
+8 条指令替换（32 字节），不改变文件大小：
 
 **Layer 1（全局 SMMU 编程旁路）：**
 
@@ -591,10 +607,18 @@ python3 patch_tee_vcp.py tee_patched.img --dry-run
 | `MOV W2, WZR` | `NOP` | |
 | `BL protection_func` | `B skip_path` | 跳转到已有零化+成功路径（skip_path 零化保护寄存器并返回成功） |
 
+**Layer 3（EMI MPU 域7访问授权）：**
+
+| 原始指令 | 补丁后 | 说明 |
+|---------|--------|------|
+| `MOV X2, X3`（站点1） | `AND X2, X3, #0xFFFFFFFFFFFF3FFF` | BL_EMIMPU handler: 清除域7 APC bits[15:14] |
+| `MOV X2, X3`（站点2） | `AND X2, X3, #0xFFFFFFFFFFFF3FFF` | TEE_EMI_MPU handler: 清除域7 APC bits[15:14] |
+
 ### 注意事项
 
 - 此补丁与 `--patch-protpgd` 互斥，不要同时使用
 - 补丁后 VCP 仅使用内核 M4U IOMMU，不再有 SMMU 保护层（GZ 禁用时可接受）
+- Layer 3 将域7（VCP/APU）的 EMI MPU APC 设为无保护，域7可访问所有 EMI region
 - 脚本使用模式匹配，不依赖固定文件偏移，具备跨固件版本通用性
 - 无法自动还原（原始 BL 目标地址不可恢复），需保留原始 tee.img
 
@@ -809,28 +833,35 @@ vcp: watchdog timeout
   VCP DMA → SMMU 查 protpgd → PA=0x0 → translation fault
   VCP 看门狗超时 → WDT reset → 循环重启 ✗
 
-修复后流程 (GZ 禁用, 已打两层 ATF 补丁):
+修复后流程 (GZ 禁用, 已打三层 ATF 补丁):
   Layer 1: 保护函数内部 SMMU 编程 BL → MOVZ W0,#0
     → 所有 5 个调用点 (iommu_secure/cmdq/display/VCP 等) 都不编程 SMMU 硬件
   Layer 2: vcp_smc_vcp_init 跳过保护调用
     → 跳到 skip_path 零化保护寄存器并返回成功
     → 返回成功
+  Layer 3: EMI MPU SMC handler 清除域7 APC 位
+    → MOV X2,X3 改为 AND X2,X3,#0xFFFFFFFFFFFF3FFF
+    → 域7 (VCP/APU) APC 值变为 00 (无保护) → 无 EMI MPU 违规
   VCP 仅使用内核 M4U IOMMU → 正常工作 ✓
+  EMI MPU 不再阻止域7访问 → 无违规洪泛 ✓
 ```
 
 #### 解决方案
 
 | 方案 | 工具 | 效果 | 适用场景 |
 |------|------|------|---------|
-| **ATF 补丁**（推荐） | `patch_tee_vcp.py tee.img` | 跳过 SMMU 保护，VCP 正常工作 | 有 tee.img 且能绕过签名 |
+| **ATF 补丁**（推荐） | `patch_tee_vcp.py tee.img` | 跳过 SMMU 保护 + EMI MPU 域7授权，VCP 正常工作 | 有 tee.img 且能绕过签名 |
 | **VCP 禁用**（备用） | `detect_lk_gz.py lk.img --patch-vcp` | 完全禁用 VCP，无 IOMMU 调用 | ATF 补丁不可用时 |
 
 #### 诊断步骤
 
-1. **确认是 VCP 问题**：观察重启间隔。约 60 秒固定间隔 → 大概率是 VCP 看门狗。随机时间重启 → 可能是其他问题
-2. **抓日志**：如果能连接 adb，开机后立即运行 `adb logcat | grep -iE "iommu|vcp|translation|fault|watchdog"` 捕获关键日志
+1. **确认问题类型**：
+   - 约 60 秒固定间隔重启 → 大概率是 VCP 看门狗（SMMU 空页表，Layer 1+2 解决）
+   - 约 40 秒崩溃 → 大概率是 EMI MPU 违规洪泛（域7无权限，Layer 3 解决）
+   - 随机时间重启 → 可能是其他问题
+2. **抓日志**：如果能连接 adb，开机后立即运行 `adb logcat | grep -iE "iommu|vcp|translation|fault|watchdog|emi_mpu|violation"` 捕获关键日志
 3. **确认 GZ 已禁用**：`adb shell cat /proc/device-tree/chosen/atag,gz` 或搜索 dmesg 中的 `NoGZ` / `gz is disabled` 字样
-4. **检查 tee.img**：用 `patch_tee_vcp.py tee.img --dry-run` 确认能找到补丁点
+4. **检查 tee.img**：用 `patch_tee_vcp.py tee.img --dry-run` 确认能找到补丁点（应显示 8 条指令替换）
 
 #### 常见问题
 
@@ -845,7 +876,7 @@ vcp: watchdog timeout
 
 **补丁后仍然 60 秒重启**
 
-1. 确认使用的是最新版 `patch_tee_vcp.py`（两层补丁，6 条指令）。旧版只补丁 VCP handler（Layer 2），不够——iommu_secure.ko 在 VCP 启动前就通过其他调用点编程了 SMMU
+1. 确认使用的是最新版 `patch_tee_vcp.py`（三层补丁，8 条指令）。旧版只补丁 VCP handler（Layer 2），不够——iommu_secure.ko 在 VCP 启动前就通过其他调用点编程了 SMMU
 2. 确认从原始未补丁的 tee.img 打补丁（不要在已部分补丁的文件上操作）
 3. 确认 tee.img 已正确刷入（对比文件大小和 md5）
 4. 确认签名验证已被绕过（否则补丁后的 tee.img 会被拒绝加载，设备可能回退到 ROM 中的原始 ATF）
@@ -857,6 +888,18 @@ vcp: watchdog timeout
 - 确认内核 IOMMU 驱动正常加载（`dmesg | grep mtk_iommu`）
 - 确认 VCP 固件已被 LK 加载（`dmesg | grep -i vcp`）
 - 如果是特定视频格式/分辨率失败，可能与 SMMU 保护无关
+
+**补丁后约 40 秒崩溃（EMI MPU 违规洪泛）**
+
+如果使用旧版 `patch_tee_vcp.py`（仅 Layer 1+2，无 Layer 3），设备可能在启动约 40 秒后因 EMI MPU 违规洪泛而崩溃。内核日志中可能看到：
+
+```
+emi_mpu: violation - domain 7 accessing region 10
+```
+
+这是因为 EMI MPU 域7（VCP/APU）的访问权限原本由 GZ 在启动时配置，跳过 GZ 后域7无权访问特定 region（如 PROT_SHARED，region 10）。
+
+解决方法：更新到最新版 `patch_tee_vcp.py`（三层补丁，8 条指令），Layer 3 会在 EMI MPU SMC handler 入口处清除域7的 APC 保护位。
 
 **误用 `--patch-protpgd` 和 `patch_tee_vcp.py` 同时打补丁**
 

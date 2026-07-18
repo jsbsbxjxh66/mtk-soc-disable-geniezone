@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-patch_tee_vcp.py - Patch MTK ATF (tee.img) to disable SMMU protection setup
+patch_tee_vcp.py - Patch MTK ATF (tee.img) to disable SMMU/EMI MPU for GZ bypass
 
-When GenieZone (GZ) is disabled, the SMMU protection page table (protpgd) has
-no valid entries -- GZ normally fills them at boot. Without valid entries, any
-DMA through SMMU maps to PA=0x0, causing IOMMU translation faults / WDT resets.
+When GenieZone (GZ) is disabled, two hardware protection systems cause boot
+failures that must be patched in ATF:
 
-Two-layer patch:
-  1. Global: NOP the SMMU programming BL inside the protection function itself,
-     so ALL callers (iommu_secure init, cmdq, display, VCP, ...) skip SMMU
-     hardware configuration. This prevents the empty protpgd from being loaded
-     into SMMU registers.
-  2. VCP handler: patch vcp_smc_vcp_init to skip the protection call entirely
-     and jump to the existing "zero+succeed" path, so the VCP handler never
-     processes the protpgd pointer.
+A) SMMU: The protection page table (protpgd) has no valid entries -- GZ normally
+   fills them at boot. Without valid entries, DMA through SMMU maps to PA=0x0,
+   causing IOMMU translation faults / WDT resets.
 
-Layer 1 alone would fix the SMMU fault, but VCP's handler code would still
-process the returned (empty) protpgd pointer. Layer 2 alone was insufficient
-because iommu_secure.ko calls OTHER SMC handlers that also invoke the same
-protection function -- those paths still programmed SMMU before VCP started.
+B) EMI MPU: Domain 7 (VCP/APU) loses access to PROT_SHARED memory region
+   because GZ normally proxied VCP memory requests. Without GZ, VCP hits EMI
+   MPU violations directly, causing a 12K+ IRQ storm and kernel crash.
+
+Three-layer patch:
+  1. Global SMMU bypass: NOP the SMMU programming BL inside the protection
+     function so ALL callers skip SMMU hardware configuration.
+  2. VCP handler skip: patch vcp_smc_vcp_init to skip the protection call
+     and jump to the existing "zero+succeed" path.
+  3. EMI MPU domain 7 access: patch EMI MPU SMC handlers to clear domain 7's
+     APC bits (positions [15:14]) before programming, granting VCP/APU full
+     access to all EMI MPU regions.
 
 Usage:
     python3 patch_tee_vcp.py tee.img -o tee_patched.img
@@ -37,6 +39,10 @@ import shutil
 
 MTK_IMG_HDR_SIZE = 0x200
 NOP = 0xD503201F
+# AND X2, X3, #0xFFFFFFFFFFFF3FFF -- clears bits [15:14] (domain 7 APC = "no protection")
+AND_X2_X3_CLR_D7 = 0x9270F462
+# Original MOV X2, X3
+MOV_X2_X3 = 0xAA0303E2
 
 
 def read_u32(data, off):
@@ -240,7 +246,76 @@ def find_vcp_anchor(data):
     return site
 
 
-def build_patches(data, site):
+def find_emi_mpu_sites(data):
+    """
+    Find EMI MPU SMC handler sites where APC is passed to emi_mpu_config.
+
+    Pattern: MOV X0,X1; MOV X1,X2; MOV X2,X3; B <target>
+    This is the SMC arg-shift before tail-calling emi_mpu_config.
+    We only patch sites whose B target is emi_mpu_config (identified by
+    multiple callers sharing the same target -- unique among these patterns).
+    We patch MOV X2,X3 → AND X2,X3,#~0xC000 to clear domain 7's APC bits.
+    """
+    code_base = MTK_IMG_HDR_SIZE
+    pattern = struct.pack('<III', 0xAA0103E0, 0xAA0203E1, MOV_X2_X3)
+    patched_pattern = struct.pack('<III', 0xAA0103E0, 0xAA0203E1, AND_X2_X3_CLR_D7)
+
+    # First pass: collect all matches and their B targets
+    candidates = []  # (mov_x2_x3_file_off, b_target_code_off, is_patched)
+    pos = code_base
+    while True:
+        idx = data.find(pattern, pos)
+        idx_p = data.find(patched_pattern, pos)
+        found = None
+        is_patched = False
+        if idx >= 0 and (idx_p < 0 or idx <= idx_p):
+            found = idx
+        elif idx_p >= 0:
+            found = idx_p
+            is_patched = True
+        if found is None:
+            break
+        b_off = found + 12
+        if b_off + 4 <= len(data):
+            w = read_u32(data, b_off)
+            if (w & 0xFC000000) == 0x14000000:
+                co = b_off - code_base
+                imm = w & 0x3FFFFFF
+                if imm & 0x2000000:
+                    imm -= 0x4000000
+                tgt = co + imm * 4
+                candidates.append((found + 8, tgt, is_patched))
+        pos = found + 4
+
+    if not candidates:
+        print("  [!] No EMI MPU handler sites found")
+        return []
+
+    # Second pass: identify emi_mpu_config as the target with multiple callers
+    from collections import Counter
+    tgt_counts = Counter(tgt for _, tgt, _ in candidates)
+    emi_mpu_config_tgt = tgt_counts.most_common(1)[0]
+
+    if emi_mpu_config_tgt[1] < 2:
+        print("  [!] No shared emi_mpu_config target found among %d candidates" %
+              len(candidates))
+        return []
+
+    target_co = emi_mpu_config_tgt[0]
+    sites = []
+    for foff, tgt, patched in candidates:
+        if tgt == target_co:
+            sites.append((foff, patched))
+            state_str = " [already patched]" if patched else ""
+            print("  [+] EMI MPU APC pass at file 0x%06X → emi_mpu_config 0x%06X%s" %
+                  (foff, target_co, state_str))
+
+    print("  [+] EMI MPU: %d site(s) targeting emi_mpu_config (filtered from %d candidates)" %
+          (len(sites), len(candidates)))
+    return sites
+
+
+def build_patches(data, site, emi_sites=None):
     """
     Build patch entries: list of (file_offset, original_4bytes, patched_4bytes, desc).
 
@@ -297,6 +372,14 @@ def build_patches(data, site):
     for foff, patch_word, desc in vcp_descs:
         orig_bytes = data[foff:foff + 4]
         patches.append((foff, orig_bytes, struct.pack('<I', patch_word), desc))
+
+    # --- Group C: EMI MPU domain 7 access ---
+    if emi_sites:
+        for foff, already_patched in emi_sites:
+            orig_bytes = struct.pack('<I', MOV_X2_X3)
+            patch_bytes = struct.pack('<I', AND_X2_X3_CLR_D7)
+            patches.append((foff, orig_bytes, patch_bytes,
+                            "AND X2, X3, #~0xC000 (clear domain 7 APC bits)"))
 
     return patches
 
@@ -391,6 +474,9 @@ Detection strategy (device-independent):
         print("[!] %s" % e)
         return 1
 
+    print("[*] Searching for EMI MPU handler sites...")
+    emi_sites = find_emi_mpu_sites(data)
+
     if site.is_patched:
         print()
         if args.restore:
@@ -403,7 +489,7 @@ Detection strategy (device-independent):
 
     print("[*] Building patch...")
     try:
-        patches = build_patches(data, site)
+        patches = build_patches(data, site, emi_sites)
     except RuntimeError as e:
         print("[!] %s" % e)
         return 1
@@ -412,16 +498,22 @@ Detection strategy (device-independent):
 
     print()
     has_global = site.prot_prog_bl_off is not None
-    print("  Patch plan (%d instructions%s):" % (
-        len(patches), ", 2 layers" if has_global else ""))
+    has_emi = bool(emi_sites)
+    n_layers = 1 + int(has_global) + int(has_emi)
+    print("  Patch plan (%d instructions, %d layers):" % (len(patches), n_layers))
     print("  %-12s  %-10s  %-10s  %s" %
           ("File offset", "Original", "Patched", "Description"))
     print("  " + "-" * 72)
+    layer1_count = 1 if has_global else 0
+    layer2_count = 5
+    layer3_start = layer1_count + layer2_count
     if has_global:
         print("  --- Layer 1: global SMMU programming bypass ---")
     for i, (foff, orig, patch, desc) in enumerate(patches):
         if has_global and i == 1:
             print("  --- Layer 2: VCP handler skip ---")
+        if has_emi and i == layer3_start:
+            print("  --- Layer 3: EMI MPU domain 7 access ---")
         actual = data[foff:foff + 4]
         marker = ""
         if actual == patch:
@@ -473,6 +565,10 @@ Detection strategy (device-independent):
         print("      → zeros SMMU protection registers")
         print("      → jumps to existing zero+succeed path")
         print("      → VCP init returns success without processing protpgd pointer")
+        if has_emi:
+            print("    Layer 3 (EMI MPU): domain 7 APC bits cleared in SMC handlers")
+            print("      → VCP/APU (domain 7) gets full access to all EMI MPU regions")
+            print("      → prevents 12K+ EMI MPU violation IRQ storm on PROT_SHARED")
         print()
         print("  All devices use only the kernel's M4U IOMMU (no secure SMMU protection).")
         print("  Do NOT use --patch-protpgd with this patch.")
