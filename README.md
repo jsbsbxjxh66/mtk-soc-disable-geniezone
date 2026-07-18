@@ -1,6 +1,6 @@
 # mtk-soc-disable-geniezone
 
-禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。LK 方案支持 bl2_ext GZ 初始化管线补丁和 DTB VCP 节点禁用。ATF 方案支持三层补丁：SMMU 保护跳过 + VCP handler 旁路 + EMI MPU 域7访问授权。
+禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。LK 方案支持 bl2_ext GZ 初始化管线补丁和 DTB VCP 节点禁用。ATF 方案支持三层补丁：SMMU 保护跳过 + VCP handler 旁路 + DEVMPU 重置（清除 preloader 设置的所有硬件访问限制）。
 
 > **免责声明**
 >
@@ -13,7 +13,7 @@
 | `detect_gz_bypass.py` | 分析 preloader 固件，检测 GPT 修改方案是否可用，推荐无效 LBA 或重名子方案 |
 | `patch_gz_gpt.py` | 修改 GPT 分区表（PGPT）：重名 gz→gx（`--rename`）或将 LBA 指向无效地址（默认） |
 | `detect_lk_gz.py` | 分析 LK 固件，检测并修补 bl2_ext GZ 初始化管线，支持 DTB VCP 节点禁用 |
-| `patch_tee_vcp.py` | 补丁 ATF (tee.img)，三层补丁：跳过 SMMU 保护设置 + EMI MPU 域7访问授权，解决禁用 GZ 后 VCP 崩溃和 EMI MPU 违规问题 |
+| `patch_tee_vcp.py` | 补丁 ATF (tee.img)，三层补丁：跳过 SMMU 保护设置 + DEVMPU 重置，解决禁用 GZ 后 VCP 崩溃和 DEVMPU 违规问题 |
 
 ## 两种方案
 
@@ -22,7 +22,7 @@
 | **GPT 重名方案** | Preloader | `halt_on_assert` 未强制置 1 且主引导循环无 gz 硬依赖 | 否 |
 | **GPT 无效 LBA 方案** | Preloader | `halt_on_assert` 未被强制置 1 | 否 |
 | **LK bl2_ext 方案** | LK (bl2_ext 段) | bl2_ext 中存在 GZ 初始化管线 | 是 |
-| **ATF VCP 修复** | ATF (tee.img) | ATF 中存在 vcp_smc_vcp_init 函数和 EMI MPU SMC handler | 是 |
+| **ATF VCP 修复** | ATF (tee.img) | ATF 中存在 vcp_smc_vcp_init 函数和 DEVMPU 初始化函数 | 是 |
 | **VCP 禁用** | LK (DTB) | LK 中 DTB 存在 vcp-support 节点 | 是 |
 
 - GPT 方案有两个子方案，均不修改代码：
@@ -31,12 +31,12 @@
 - LK bl2_ext 方案（MT6991 等）— GZ 逻辑在 bl2_ext 段，使用 Hafnium S-EL2 + GenieZone 架构：
   - **方案 A** (`--patch-validate`)：补丁 `gz_config_validate` 返回 0，跳过 GZ 初始化
   - **方案 B** (`--patch-init-fail`)：强制 `gz_init_main` 跳转到错误清理路径，触发 `gz_mblock_free_all` 释放内存
-- VCP 修复/禁用（MT6895 等）— 使用 GPT 方案跳过 GZ 后，VCP 子系统因 SMMU 保护页表为空而导致看门狗超时重启，以及 EMI MPU 域7访问违规洪泛：
-  - **ATF VCP 修复** (`patch_tee_vcp.py`，推荐）：三层补丁 ATF。Layer 1 在 SMMU 保护函数内部跳过硬件编程（覆盖所有 5 个调用点），Layer 2 在 `vcp_smc_vcp_init` 中跳过保护调用并走"零化+成功"路径，Layer 3 在 `emi_mpu_config` 函数入口清除域7（VCP/APU）的 APC 位，覆盖所有调用路径（ATF 启动初始化 + 运行时 SMC），授予域7对所有 EMI MPU region 的访问权限。VCP 仅使用内核 M4U IOMMU（正常工作），无需 SMMU 保护层。视频硬件编解码不受影响
+- VCP 修复/禁用（MT6895 等）— 使用 GPT 方案跳过 GZ 后，VCP 子系统因 SMMU 保护页表为空而导致看门狗超时重启，以及 DEVMPU 域7访问违规洪泛：
+  - **ATF VCP 修复** (`patch_tee_vcp.py`，推荐）：三层补丁 ATF。Layer 1 在 SMMU 保护函数内部跳过硬件编程（覆盖所有 5 个调用点），Layer 2 在 `vcp_smc_vcp_init` 中跳过保护调用并走"零化+成功"路径，Layer 3 在 DEVMPU init 函数中注入 devmpu_reset 调用（通过 code cave 中的 trampoline），在 DEVMPU 启用前写入 reset 命令（7→1）到控制寄存器 `0x10351104`/`0x10355104`，清除 preloader 设置的所有 DEVMPU APC（Access Permission Control）限制。VCP 仅使用内核 M4U IOMMU（正常工作），无需 SMMU 保护层。视频硬件编解码不受影响
   - **VCP 禁用** (`--patch-vcp`，备用）：将 LK DTB 中所有主 VCP 节点的 `vcp-support=1` 改为 0，同时将 `status="okay"` 改为 `"fail"`，LK 不再加载 VCP 固件，内核 VCP 驱动不 probe，避免 IOMMU 超时。视频硬件编解码不可用
 - 脚本自动检测 LK 中的 bl2_ext GZ 初始化管线和 DTB VCP 节点
 - 部分平台 GPT 方案不可用（如 `halt_on_assert` 被强制置 1 的平台），此时需要 LK 方案
-- 部分平台使用 GPT 方案跳过 GZ 后需处理 VCP 问题：GZ 负责填充 SMMU 保护页表（protpgd）的页表项，跳过 GZ 后页表为空，VCP DMA 映射到 PA=0x0 触发 IOMMU translation fault → 60 秒看门狗超时重启。此外，EMI MPU 域7（VCP/APU）的访问权限由 GZ 配置，跳过 GZ 后域7无权访问某些 EMI region，导致 EMI MPU 违规洪泛（约启动后 40 秒触发）。推荐使用 `patch_tee_vcp.py` 三层补丁 ATF（跳过 SMMU 保护 + EMI MPU 域7授权，保留 VCP 功能），或使用 `--patch-vcp` 禁用 VCP
+- 部分平台使用 GPT 方案跳过 GZ 后需处理 VCP 问题：GZ 负责填充 SMMU 保护页表（protpgd）的页表项，跳过 GZ 后页表为空，VCP DMA 映射到 PA=0x0 触发 IOMMU translation fault → 60 秒看门狗超时重启。此外，DEVMPU（Device Memory Protection Unit）的域7（VCP/APU）访问限制由 preloader 设置，正常情况下 VCP 通过 GZ 代理访问受保护内存，跳过 GZ 后 VCP 直接访问被 DEVMPU 拒绝，导致 DEVMPU 违规洪泛（约启动后 33 秒触发 12000+ 次违规 → IRQ 风暴 → HWT 崩溃）。推荐使用 `patch_tee_vcp.py` 三层补丁 ATF（跳过 SMMU 保护 + DEVMPU 重置，保留 VCP 功能），或使用 `--patch-vcp` 禁用 VCP
 - MT6991 等新式平台 GPT 方案不可用：preloader 不再负责加载 GZ，GZ 加载由 bl2_ext 执行。修改 GPT 后设备能进 fastboot，但无法正常启动——bl2_ext 的 `gz_init_main` 会在分区加载失败前执行不可逆的硬件配置（内存重映射、mblock 分配等），cleanup 无法完全逆转这些变更。需使用 LK bl2_ext 方案
 
 ## 快速开始
@@ -465,22 +465,23 @@ GZ 被跳过
   → IOMMU translation fault → 无限 WDT 重启循环
 
   同时:
-  → EMI MPU 域7 (VCP/APU) 的访问权限未被 GZ 配置
-  → 域7访问 PROT_SHARED 等 region 触发 EMI MPU 违规
-  → EMI MPU 违规洪泛 → 约 40 秒后系统崩溃
+  → DEVMPU APC 由 preloader 编程，限制域7 (VCP/APU) 访问 PROT_SHARED
+  → 正常时 VCP 通过 GZ 代理访问 (GZ 有权限)
+  → GZ 被跳过后 VCP 直接访问被 DEVMPU 拒绝
+  → 12000+ 次 DEVMPU 违规 → IRQ 风暴 → 约 33 秒后 HWT 崩溃
 ```
 
 提供两种解决方案：
 
 #### 推荐方案：ATF VCP 补丁 (`patch_tee_vcp.py`)
 
-三层补丁 ATF，跳过 SMMU 保护设置并授权 EMI MPU 域7访问。
+三层补丁 ATF，跳过 SMMU 保护设置并重置 DEVMPU。
 
-**背景**：ATF 中有一个 SMMU 保护函数（如 0x013BA0），被 5 个不同的 SMC handler 调用（iommu_secure init W3=4、cmdq W3=2、display W3=0、W3=3、VCP W3=1）。该函数内部先做验证/查找（第 1 个 BL），再做 SMMU 硬件编程（第 2 个 BL）。当 GZ 被禁用时，protpgd 页表为空，任何一个调用点触发 SMMU 编程都会导致空页表被加载到硬件。
+**背景**：禁用 GZ 后 ATF 层面有两个独立的硬件保护问题：
 
-内核的 `iommu_secure.ko` 在启动早期（~1.1s）就通过 site1-4 调用保护函数编程 SMMU，远早于 VCP 启动（~7.7s）。因此仅补丁 VCP handler（Layer 2）不够——SMMU 在 VCP 启动前就已被空页表配置。
+1. **SMMU 保护页表为空**：ATF 中有一个 SMMU 保护函数，被 5 个不同的 SMC handler 调用。该函数内部先做验证/查找，再做 SMMU 硬件编程。当 GZ 被禁用时，protpgd 页表为空，任何一个调用点触发 SMMU 编程都会导致空页表被加载到硬件。内核的 `iommu_secure.ko` 在启动早期（~1.1s）就通过 SMC 调用编程 SMMU，远早于 VCP 启动（~7.7s），因此仅补丁 VCP handler 不够。
 
-此外，EMI MPU（External Memory Interface Memory Protection Unit）的域7（VCP/APU）访问权限原本由 GZ 配置。跳过 GZ 后，域7对某些 EMI region（如 PROT_SHARED，region 10）无访问权限，导致 EMI MPU 违规洪泛，约启动后 40 秒触发系统崩溃。Layer 3 通过在 `emi_mpu_config` 函数入口处清除 APC 参数中域7的保护位，覆盖所有调用路径（ATF 启动时 `mpu_init` 链直接调用 + 运行时 SMC handler 调用），授予域7对所有 region 的访问权限。
+2. **DEVMPU APC 限制**：DEVMPU（Device Memory Protection Unit，位于 0x10351000/0x10355000）是 MTK 平台的可编程内存保护单元。Preloader 在启动时编程 DEVMPU APC（Access Permission Control）寄存器，限制域7（VCP/APU）访问 PROT_SHARED 内存区域（region 10）。正常情况下 VCP 的内存请求通过 GZ 代理（GZ 有权限），但禁用 GZ 后 VCP 直接访问被 DEVMPU 拒绝——触发 12000+ 次违规中断，形成 IRQ 风暴，约 33 秒后导致 HWT（Hardware Watchdog Timeout）崩溃。ATF 初始化 DEVMPU 时只编程区域边界（start/end addresses），不触碰 APC，preloader 设置的限制原封不动保留。
 
 **三层补丁**：
 
@@ -500,18 +501,26 @@ Layer 2 (VCP handler): vcp_smc_vcp_init 内部
   效果:  VCP handler 完全不处理 protpgd 指针
          skip_path 零化保护寄存器 [X24,#0] 和 [X24,#4] 后返回成功
 
-Layer 3 (EMI MPU 域7授权): emi_mpu_config 函数入口
-  原始:  MOV X19, X2            ; 保存 APC 参数到 callee-saved 寄存器
-  补丁:  AND X19, X2, #0xFFFFFFFFFFFF3FFF  ; 保存时清除 bits[15:14]（域7 APC 位）
-  效果:  域7（VCP/APU）对所有 EMI MPU region 的 APC 值变为 00（无保护）
-         覆盖所有调用路径：
-         - ATF 启动初始化: mpu_init → sub_fce0 → wrapper → emi_mpu_config
-         - 运行时 SMC: MTK_SIP_BL_EMIMPU_CONTROL / MTK_SIP_TEE_EMI_MPU_CONTROL
+Layer 3 (DEVMPU 重置): DEVMPU init 函数 + code cave trampoline
+  在 DEVMPU init 函数中，将启用 ch0 的 STR 指令替换为 BL 跳转到
+  code cave 中的 15 指令 trampoline。trampoline 执行:
+    1. 保存 X8, X10 到栈
+    2. 向 DEVMPU 控制寄存器写入 reset 命令:
+       - 写 7 到 0x10351104 (reset ch0, 清除所有 APC)
+       - 写 1 到 0x10351104 (reinit ch0)
+       - 写 7 到 0x10355104 (reset ch1, 清除所有 APC)
+       - 写 1 到 0x10355104 (reinit ch1)
+    3. 恢复寄存器并执行原始的 enable ch0 操作
+    4. RET 返回，继续正常的 enable ch1 和 boundary 编程
+  效果:  preloader 设置的所有 DEVMPU APC 限制被清除
+         DEVMPU 正常启用并编程区域边界，但无访问限制
+         域7 (VCP/APU) 可自由访问所有 region，包括 PROT_SHARED
+         共 16 条指令 (1 BL redirect + 15 trampoline)
 ```
 
-Layer 1 单独即可阻止 SMMU 被空页表配置，Layer 2 进一步确保 VCP handler 不处理无效的 protpgd 数据，Layer 3 消除 EMI MPU 对域7的访问限制。
+Layer 1 单独即可阻止 SMMU 被空页表配置，Layer 2 进一步确保 VCP handler 不处理无效的 protpgd 数据，Layer 3 消除 DEVMPU 对域7的访问限制。
 
-> **优势**：VCP 保持完整功能，视频硬件编解码正常工作。仅使用内核 M4U IOMMU（无 SMMU 保护层，GZ 禁用时可接受）。EMI MPU 域7（VCP/APU）获得完整访问权限，无违规洪泛。脚本使用模式匹配定位补丁点，不依赖固定偏移，具备跨固件版本通用性。
+> **优势**：VCP 保持完整功能，视频硬件编解码正常工作。仅使用内核 M4U IOMMU（无 SMMU 保护层，GZ 禁用时可接受）。DEVMPU 被完全重置，消除所有 preloader APC 限制。脚本使用模式匹配定位补丁点，不依赖固定偏移，具备跨固件版本通用性。
 
 > **注意**：此补丁与 `--patch-protpgd` 互斥。使用此补丁后 protpgd mblock 不再被访问，无需通过 bl2_ext 分配。
 
@@ -560,7 +569,7 @@ Layer 1 单独即可阻止 SMMU 被空页表配置，Layer 2 进一步确保 VCP
 
 ## patch_tee_vcp.py
 
-三层补丁 MTK ATF (tee.img)，跳过 SMMU 保护设置并授权 EMI MPU 域7访问。适用于 GPT 方案禁用 GZ 后 VCP 因空 SMMU 保护页表崩溃以及 EMI MPU 域7违规的平台（如 MT6895）。
+三层补丁 MTK ATF (tee.img)，跳过 SMMU 保护设置并重置 DEVMPU。适用于 GPT 方案禁用 GZ 后 VCP 因空 SMMU 保护页表崩溃以及 DEVMPU 域7违规的平台（如 MT6895）。
 
 ### 检测流程
 
@@ -569,7 +578,7 @@ Layer 1 单独即可阻止 SMMU 被空页表配置，Layer 2 进一步确保 VCP
 3. **调用点定位** — 从锚点向前搜索 `MOVZ W3, #1; MOV W2, WZR; BL` 原始模式或 `NOP; NOP; NOP; NOP; B` 已补丁模式
 4. **跳过路径定位** — 搜索 `STR WZR, [Xm, #0]; STUR XZR, [Xm, #4]` 零化+返回成功路径
 5. **保护函数编程 BL 定位** — 从 VCP handler 的 BL 目标地址进入保护函数，找到第 2 个 BL（SMMU 硬件编程调用）
-6. **EMI MPU 入口定位** — 搜索 `MOV X0,X1; MOV X1,X2; MOV X2,X3; B target` 模式定位 `emi_mpu_config` 函数（按 B 目标分组，多调用者的目标），在函数入口找到 `MOV Xd, X2`（保存 APC 参数），补丁为 `AND Xd, X2, #~0xC000`
+6. **DEVMPU init 定位** — 搜索 `MOVZ W8, #0x1118; MOVZ W10, #0x5118`（DEVMPU ch0/ch1 enable 寄存器地址），定位 `STR W9, [X8]`（enable ch0 写入），搜索 code cave（60+ 零字节区域）放置 trampoline
 
 ### 用法
 
@@ -589,15 +598,15 @@ python3 patch_tee_vcp.py tee_patched.img --dry-run
 
 ### 补丁内容
 
-7 条指令替换（28 字节），不改变文件大小：
+22 条指令（88 字节），不改变文件大小：
 
-**Layer 1（全局 SMMU 编程旁路）：**
+**Layer 1（全局 SMMU 编程旁路）— 1 条指令：**
 
 | 原始指令 | 补丁后 | 说明 |
 |---------|--------|------|
 | `BL smmu_programming` | `MOVZ W0, #0` | 保护函数内第 2 个 BL → 返回成功，跳过 SMMU 硬件编程 |
 
-**Layer 2（VCP handler 跳过）：**
+**Layer 2（VCP handler 跳过）— 5 条指令：**
 
 | 原始指令 | 补丁后 | 说明 |
 |---------|--------|------|
@@ -605,19 +614,40 @@ python3 patch_tee_vcp.py tee_patched.img --dry-run
 | `LDR X1, [X26, #imm]` | `NOP` | |
 | `MOVZ W3, #1` | `NOP` | |
 | `MOV W2, WZR` | `NOP` | |
-| `BL protection_func` | `B skip_path` | 跳转到已有零化+成功路径（skip_path 零化保护寄存器并返回成功） |
+| `BL protection_func` | `B skip_path` | 跳转到已有零化+成功路径 |
 
-**Layer 3（EMI MPU 域7访问授权）：**
+**Layer 3（DEVMPU 重置）— 16 条指令（1 redirect + 15 trampoline）：**
 
-| 原始指令 | 补丁后 | 说明 |
-|---------|--------|------|
-| `MOV X19, X2` | `AND X19, X2, #0xFFFFFFFFFFFF3FFF` | emi_mpu_config 入口：清除域7 APC bits[15:14]，覆盖所有调用路径 |
+| 原始 | 补丁后 | 说明 |
+|------|--------|------|
+| `STR W9, [X8]` | `BL trampoline` | DEVMPU init 中 enable ch0 → 跳转到 code cave |
+
+Trampoline（写入 code cave 的零字节区域）：
+
+| 指令 | 说明 |
+|------|------|
+| `STP X8, X10, [SP, #-0x10]!` | 保存 ch0/ch1 enable 地址 |
+| `MOVZ W8, #0x1104` | ch0 control register (low) |
+| `MOVZ W11, #0x5104` | ch1 control register (low) |
+| `MOVK W8, #0x1035, LSL#16` | W8 = 0x10351104 |
+| `MOVZ W9, #7` | reset 命令 |
+| `MOVZ W10, #1` | reinit 命令 |
+| `MOVK W11, #0x1035, LSL#16` | W11 = 0x10355104 |
+| `STR W9, [X8]` | reset ch0（清除所有 APC） |
+| `STR W10, [X8]` | reinit ch0 |
+| `STR W9, [X11]` | reset ch1（清除所有 APC） |
+| `STR W10, [X11]` | reinit ch1 |
+| `LDP X8, X10, [SP], #0x10` | 恢复 ch0/ch1 enable 地址 |
+| `MOVZ W9, #1` | 恢复 enable value |
+| `STR W9, [X8]` | 执行原始操作：enable ch0 |
+| `RET` | 返回（继续 enable ch1 + boundary 编程） |
 
 ### 注意事项
 
 - 此补丁与 `--patch-protpgd` 互斥，不要同时使用
 - 补丁后 VCP 仅使用内核 M4U IOMMU，不再有 SMMU 保护层（GZ 禁用时可接受）
-- Layer 3 将域7（VCP/APU）的 EMI MPU APC 设为无保护，域7可访问所有 EMI region
+- Layer 3 重置 DEVMPU 硬件，清除 preloader 设置的所有 APC 限制，域7（VCP/APU）可访问所有 region
+- Trampoline 指令序列来自 ATF 原始 `devmpu_reset` 函数，经过交叉验证
 - 脚本使用模式匹配，不依赖固定文件偏移，具备跨固件版本通用性
 - 无法自动还原（原始 BL 目标地址不可恢复），需保留原始 tee.img
 
@@ -640,7 +670,7 @@ BROM → preloader (签名验证) → ATF → LK → kernel
                   决定是否将 EL2 移交给 GZ
 ```
 
-**v6 架构（MT6895 等，preloader 初始化 gz，LK 含 VCP，ATF 含 SMMU 保护）：**
+**v6 架构（MT6895 等，preloader 初始化 gz，LK 含 VCP，ATF 含 SMMU 保护 + DEVMPU）：**
 
 ```
 BROM → preloader (签名验证) → ATF → LK → kernel
@@ -648,16 +678,20 @@ BROM → preloader (签名验证) → ATF → LK → kernel
               ├─ gz_init():      │       ├─ app_load_vcp(): 读取 DTB
               │  读取 gz 分区     │       │   vcp-support=1 + status="okay" → 加载 VCP
               │  配置 NoGZ 标志   │       │   vcp-support=0 或 status≠"okay" → 跳过
-              ├─ 分区加载循环     │       └─ DTB: trusty-gz / nebula / vcp 节点 → kernel
+              ├─ DEVMPU APC:     │       └─ DTB: trusty-gz / nebula / vcp 节点 → kernel
+              │  preloader 编程   │
+              │  域7限制          │
+              ├─ 分区加载循环     │
               └─ ATF 跳转        │
                                  ├─ SMMU 保护函数 (被 5 个 SMC handler 调用):
-                                 │   iommu_secure init (W3=4), cmdq (W3=2),
-                                 │   display (W3=0), W3=3, VCP (W3=1)
-                                 │   内部: 验证/查找 BL → SMMU 编程 BL
                                  │   GZ 跳过时 protpgd 为空 → DMA PA=0x0 → fault
                                  │   patch_tee_vcp.py Layer 1: 编程 BL → MOVZ W0,#0
                                  ├─ vcp_smc_vcp_init:
                                  │   patch_tee_vcp.py Layer 2: 跳过保护调用 → 零化+成功
+                                 ├─ DEVMPU init:
+                                 │   只编程区域边界，不碰 APC (preloader 限制保留)
+                                 │   GZ 跳过时域7被 DEVMPU 拒绝 → 12K+ 违规 → HWT
+                                 │   patch_tee_vcp.py Layer 3: 注入 devmpu_reset trampoline
                                  └─ VCP 仅使用内核 M4U IOMMU (正常工作)
 ```
 
@@ -676,7 +710,7 @@ BROM → preloader (签名验证) → ATF → LK (bl2_ext) → LK (lk) → kerne
 ```
 
 - **GPT 方案**（MT6833/MT6893 等）：作用于 preloader 阶段，让 gz 分区 I/O 失败 → NoGZ → 跳过 GZ 加载。LK 无 GZ 代码，GPT 方案即可完全禁用
-- **GPT + ATF VCP 修复**（MT6895 等）：GPT 方案触发 NoGZ 跳过 GZ，但 VCP 因 SMMU 保护页表为空导致超时重启，需配合 `patch_tee_vcp.py` 补丁 ATF（推荐，保留 VCP 功能）或 `--patch-vcp`（禁用 VCP）
+- **GPT + ATF VCP 修复**（MT6895 等）：GPT 方案触发 NoGZ 跳过 GZ，但 VCP 因 SMMU 保护页表为空和 DEVMPU APC 限制导致崩溃，需配合 `patch_tee_vcp.py` 补丁 ATF（推荐，保留 VCP 功能）或 `--patch-vcp`（禁用 VCP）
 - **bl2_ext 方案 A**：补丁 gz_config_validate → 返回 0 → 跳过 bl2_ext 中的 GZ 初始化
 - **bl2_ext 方案 B**：补丁 gz_init_main → 强制走失败路径 → gz_mblock_free_all 释放内存
 
@@ -824,44 +858,47 @@ vcp: watchdog timeout
 异常流程 (GZ 禁用, 未打 ATF 补丁):
   bl2_ext 分配 protpgd mblock (2MB) → 全零
   ATF 映射 protpgd 到 VA 空间
-  GZ 未启动 → protpgd 页表项全为 0                   ← 根因
+  GZ 未启动 → protpgd 页表项全为 0                   ← 根因 1
+  DEVMPU APC 由 preloader 编程，限制域7              ← 根因 2
+  ATF DEVMPU init: 只编程区域边界，不碰 APC (preloader 限制保留)
   内核启动 (~1.1s) → iommu_secure.ko → SMC 调用保护函数 (site1-4)
   ATF 用空 protpgd 编程 SMMU → 所有映射指向 PA=0x0   ← 早于 VCP 启动
   VCP 启动 (~7.7s) → SMC vcp_smc_vcp_init (site5)
-  ATF 再次用空 protpgd 配置 VCP SMMU
   VCP DMA → SMMU 查 protpgd → PA=0x0 → translation fault
-  VCP 看门狗超时 → WDT reset → 循环重启 ✗
+  VCP 访问 PROT_SHARED → DEVMPU 拒绝 → 12K+ 违规 → IRQ 风暴
+  ~33s HWT 崩溃 或 ~60s VCP 看门狗超时 → WDT reset ✗
 
 修复后流程 (GZ 禁用, 已打三层 ATF 补丁):
   Layer 1: 保护函数内部 SMMU 编程 BL → MOVZ W0,#0
     → 所有 5 个调用点 (iommu_secure/cmdq/display/VCP 等) 都不编程 SMMU 硬件
   Layer 2: vcp_smc_vcp_init 跳过保护调用
     → 跳到 skip_path 零化保护寄存器并返回成功
-    → 返回成功
-  Layer 3: emi_mpu_config 入口清除域7 APC 位
-    → MOV X19,X2 改为 AND X19,X2,#0xFFFFFFFFFFFF3FFF
-    → 覆盖全部调用路径 (ATF init + SMC runtime)
-    → 域7 (VCP/APU) APC 值变为 00 (无保护) → 无 EMI MPU 违规
+  Layer 3: DEVMPU init 注入 devmpu_reset trampoline
+    → STR W9,[X8] 替换为 BL trampoline (code cave)
+    → trampoline 写 7→1 到 DEVMPU 控制寄存器 (0x10351104/0x10355104)
+    → 清除 preloader 设置的所有 DEVMPU APC 限制
+    → 恢复寄存器后执行原始 enable 操作
+    → 域7 (VCP/APU) 不再被限制 → 无 DEVMPU 违规
   VCP 仅使用内核 M4U IOMMU → 正常工作 ✓
-  EMI MPU 不再阻止域7访问 → 无违规洪泛 ✓
+  DEVMPU 不再阻止域7访问 → 无违规洪泛 ✓
 ```
 
 #### 解决方案
 
 | 方案 | 工具 | 效果 | 适用场景 |
 |------|------|------|---------|
-| **ATF 补丁**（推荐） | `patch_tee_vcp.py tee.img` | 跳过 SMMU 保护 + EMI MPU 域7授权，VCP 正常工作 | 有 tee.img 且能绕过签名 |
+| **ATF 补丁**（推荐） | `patch_tee_vcp.py tee.img` | 跳过 SMMU 保护 + DEVMPU 重置，VCP 正常工作 | 有 tee.img 且能绕过签名 |
 | **VCP 禁用**（备用） | `detect_lk_gz.py lk.img --patch-vcp` | 完全禁用 VCP，无 IOMMU 调用 | ATF 补丁不可用时 |
 
 #### 诊断步骤
 
 1. **确认问题类型**：
    - 约 60 秒固定间隔重启 → 大概率是 VCP 看门狗（SMMU 空页表，Layer 1+2 解决）
-   - 约 40 秒崩溃 → 大概率是 EMI MPU 违规洪泛（域7无权限，Layer 3 解决）
+   - 约 33-40 秒崩溃 → 大概率是 DEVMPU 违规洪泛（域7无权限，Layer 3 解决）
    - 随机时间重启 → 可能是其他问题
-2. **抓日志**：如果能连接 adb，开机后立即运行 `adb logcat | grep -iE "iommu|vcp|translation|fault|watchdog|emi_mpu|violation"` 捕获关键日志
+2. **抓日志**：如果能连接 adb，开机后立即运行 `adb logcat | grep -iE "iommu|vcp|translation|fault|watchdog|emi_mpu|devmpu|violation"` 捕获关键日志
 3. **确认 GZ 已禁用**：`adb shell cat /proc/device-tree/chosen/atag,gz` 或搜索 dmesg 中的 `NoGZ` / `gz is disabled` 字样
-4. **检查 tee.img**：用 `patch_tee_vcp.py tee.img --dry-run` 确认能找到补丁点（应显示 7 条指令替换）
+4. **检查 tee.img**：用 `patch_tee_vcp.py tee.img --dry-run` 确认能找到补丁点（应显示 22 条指令替换）
 
 #### 常见问题
 
@@ -876,7 +913,7 @@ vcp: watchdog timeout
 
 **补丁后仍然 60 秒重启**
 
-1. 确认使用的是最新版 `patch_tee_vcp.py`（三层补丁，7 条指令）。旧版只补丁 VCP handler（Layer 2），不够——iommu_secure.ko 在 VCP 启动前就通过其他调用点编程了 SMMU
+1. 确认使用的是最新版 `patch_tee_vcp.py`（三层补丁，22 条指令）。旧版只补丁 VCP handler（Layer 2），不够——iommu_secure.ko 在 VCP 启动前就通过其他调用点编程了 SMMU
 2. 确认从原始未补丁的 tee.img 打补丁（不要在已部分补丁的文件上操作）
 3. 确认 tee.img 已正确刷入（对比文件大小和 md5）
 4. 确认签名验证已被绕过（否则补丁后的 tee.img 会被拒绝加载，设备可能回退到 ROM 中的原始 ATF）
@@ -889,17 +926,18 @@ vcp: watchdog timeout
 - 确认 VCP 固件已被 LK 加载（`dmesg | grep -i vcp`）
 - 如果是特定视频格式/分辨率失败，可能与 SMMU 保护无关
 
-**补丁后约 40 秒崩溃（EMI MPU 违规洪泛）**
+**补丁后约 33-40 秒崩溃（DEVMPU 违规洪泛）**
 
-如果使用旧版 `patch_tee_vcp.py`（仅 Layer 1+2，无 Layer 3），设备可能在启动约 40 秒后因 EMI MPU 违规洪泛而崩溃。内核日志中可能看到：
+如果使用旧版 `patch_tee_vcp.py`（仅 Layer 1+2，无 Layer 3），设备可能在启动约 33-40 秒后因 DEVMPU 违规洪泛而崩溃。内核日志或 expdb.log 中可能看到：
 
 ```
-emi_mpu: violation - domain 7 accessing region 10
+[emi_mpu] Clear DEVMPU violation. emi: 0x0, devmpu: 0x1
+emi_mpu: violation - domain 7, region 10, master 0x2C06
 ```
 
-这是因为 EMI MPU 域7（VCP/APU）的访问权限原本由 GZ 在启动时配置，跳过 GZ 后域7无权访问特定 region（如 PROT_SHARED，region 10）。
+这是因为 DEVMPU 的 APC（Access Permission Control）由 preloader 编程，限制域7（VCP/APU）访问 PROT_SHARED 等 region。正常情况下 VCP 通过 GZ 代理访问（GZ 有权限），禁用 GZ 后 VCP 直接访问被 DEVMPU 拒绝，产生 12000+ 次违规中断 → IRQ 风暴 → HWT 崩溃。
 
-解决方法：更新到最新版 `patch_tee_vcp.py`（三层补丁，7 条指令），Layer 3 会在 `emi_mpu_config` 函数入口处清除域7的 APC 保护位，覆盖所有调用路径（ATF 启动初始化 + 运行时 SMC）。
+解决方法：更新到最新版 `patch_tee_vcp.py`（三层补丁，22 条指令），Layer 3 在 DEVMPU init 中注入 devmpu_reset trampoline，在 DEVMPU 启用前写入 reset 命令（7→1）到控制寄存器，清除 preloader 设置的所有 APC 限制。
 
 **误用 `--patch-protpgd` 和 `patch_tee_vcp.py` 同时打补丁**
 
@@ -938,7 +976,7 @@ emi_mpu: violation - domain 7 accessing region 10
 - **LK 签名**：LK 方案修改了代码/数据，需要不校验签名的 preloader 或 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名
 - **处理器代际差异**：
   - 天玑 v5 及以下（如 MT6833/MT6893）：GPT LBA 方案通常直接可用，LK 无 GZ 代码不需要 LK 方案
-  - 天玑 v6（如 MT6895）：GPT 方案跳过 GZ 后需配合 `patch_tee_vcp.py` 三层补丁 ATF（推荐）或 `--patch-vcp` 修复 VCP 问题，否则 VCP SMMU 保护页表为空导致 IOMMU translation fault → 60 秒看门狗重启，以及 EMI MPU 域7违规洪泛 → 约 40 秒崩溃
+  - 天玑 v6（如 MT6895）：GPT 方案跳过 GZ 后需配合 `patch_tee_vcp.py` 三层补丁 ATF（推荐）或 `--patch-vcp` 修复 VCP 问题，否则 VCP SMMU 保护页表为空导致 IOMMU translation fault → 60 秒看门狗重启，以及 DEVMPU 域7违规洪泛 → 约 33 秒 HWT 崩溃
   - 天玑 v6+（如 MT6991）：GPT 方案不可用（修改 GPT 后能进 fastboot 但无法正常启动，bl2_ext 中 GZ 初始化的部分执行导致不可逆硬件配置变更），需使用 bl2_ext 方案（`--patch-validate` / `--patch-init-fail`）
   - 或使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 高级用法直接干掉 GenieZone
 - **功能影响**：禁用 GenieZone 后，依赖 GZ 虚拟化服务的功能（如部分 DRM、安全容器等）可能不可用；禁用 VCP 后，硬件视频编解码加速等功能可能不可用或回退到软件实现
