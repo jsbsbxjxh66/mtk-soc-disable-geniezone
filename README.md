@@ -1,6 +1,6 @@
 # mtk-soc-disable-geniezone
 
-禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。LK 方案支持 bl2_ext GZ 初始化管线补丁和 DTB VCP 节点禁用。ATF 方案支持 VCP SMMU 保护跳过补丁。
+禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。LK 方案支持 bl2_ext GZ 初始化管线补丁和 DTB VCP 节点禁用。ATF 方案支持三层补丁：SMMU 保护跳过 + VCP handler 旁路 + EMI MPU 域7访问授权。
 
 > **免责声明**
 >
@@ -938,7 +938,7 @@ emi_mpu: violation - domain 7 accessing region 10
 - **LK 签名**：LK 方案修改了代码/数据，需要不校验签名的 preloader 或 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名
 - **处理器代际差异**：
   - 天玑 v5 及以下（如 MT6833/MT6893）：GPT LBA 方案通常直接可用，LK 无 GZ 代码不需要 LK 方案
-  - 天玑 v6（如 MT6895）：GPT 方案跳过 GZ 后需配合 `patch_tee_vcp.py` 补丁 ATF（推荐）或 `--patch-vcp` 修复 VCP 问题，否则 VCP SMMU 保护页表为空导致 IOMMU translation fault → 60 秒看门狗重启
+  - 天玑 v6（如 MT6895）：GPT 方案跳过 GZ 后需配合 `patch_tee_vcp.py` 三层补丁 ATF（推荐）或 `--patch-vcp` 修复 VCP 问题，否则 VCP SMMU 保护页表为空导致 IOMMU translation fault → 60 秒看门狗重启，以及 EMI MPU 域7违规洪泛 → 约 40 秒崩溃
   - 天玑 v6+（如 MT6991）：GPT 方案不可用（修改 GPT 后能进 fastboot 但无法正常启动，bl2_ext 中 GZ 初始化的部分执行导致不可逆硬件配置变更），需使用 bl2_ext 方案（`--patch-validate` / `--patch-init-fail`）
   - 或使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 高级用法直接干掉 GenieZone
 - **功能影响**：禁用 GenieZone 后，依赖 GZ 虚拟化服务的功能（如部分 DRM、安全容器等）可能不可用；禁用 VCP 后，硬件视频编解码加速等功能可能不可用或回退到软件实现
