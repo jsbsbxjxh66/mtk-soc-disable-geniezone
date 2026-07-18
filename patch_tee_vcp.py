@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """
-patch_tee_vcp.py - Patch MTK ATF (tee.img) to skip VCP SMMU protection setup
+patch_tee_vcp.py - Patch MTK ATF (tee.img) to disable SMMU protection setup
 
 When GenieZone (GZ) is disabled, the SMMU protection page table (protpgd) has
-no valid entries -- GZ normally fills them at boot. Without valid entries, VCP
-DMA maps to PA=0x0, causing infinite IOMMU translation fault / WDT resets.
+no valid entries -- GZ normally fills them at boot. Without valid entries, any
+DMA through SMMU maps to PA=0x0, causing IOMMU translation faults / WDT resets.
 
-This script patches ATF's vcp_smc_vcp_init to skip the SMMU protection setup
-call, zero the protection registers, and continue to the existing "skip+succeed"
-code path. VCP then runs with only the kernel's M4U IOMMU (which works fine).
+Two-layer patch:
+  1. Global: NOP the SMMU programming BL inside the protection function itself,
+     so ALL callers (iommu_secure init, cmdq, display, VCP, ...) skip SMMU
+     hardware configuration. This prevents the empty protpgd from being loaded
+     into SMMU registers.
+  2. VCP handler: patch vcp_smc_vcp_init to skip the protection call entirely
+     and jump to the existing "zero+succeed" path, so the VCP handler never
+     processes the protpgd pointer.
+
+Layer 1 alone would fix the SMMU fault, but VCP's handler code would still
+process the returned (empty) protpgd pointer. Layer 2 alone was insufficient
+because iommu_secure.ko calls OTHER SMC handlers that also invoke the same
+protection function -- those paths still programmed SMMU before VCP started.
 
 Usage:
     python3 patch_tee_vcp.py tee.img -o tee_patched.img
@@ -16,7 +26,7 @@ Usage:
     python3 patch_tee_vcp.py tee.img --restore      # revert patch
 
 Note: do NOT use --patch-protpgd in detect_lk_gz.py together with this patch.
-      The protpgd mblock is no longer needed when the SMMU protection is skipped.
+      The protpgd mblock allocation is no longer needed when SMMU is bypassed.
 """
 
 import struct
@@ -70,6 +80,8 @@ class PatchSite:
         self.skip_file_off = None    # file offset of skip path
         self.is_patched = False      # True if patch is already applied
         self.pre_ldr_offsets = []    # file offsets of LDR instructions before BL
+        self.prot_func_file_off = None   # file offset of the protection function
+        self.prot_prog_bl_off = None     # file offset of SMMU programming BL inside prot func
 
 
 def find_vcp_anchor(data):
@@ -153,6 +165,7 @@ def find_vcp_anchor(data):
                         site.bl_file_off = off + 8
                         bl_co = site.bl_file_off - code_base
                         bl_tgt = decode_bl_target(w_bl, bl_co)
+                        site.prot_func_file_off = bl_tgt + code_base
                         print("  [+] Original BL at file 0x%06X (code 0x%06X) → 0x%06X" %
                               (site.bl_file_off, bl_co, bl_tgt))
                         # Record LDR positions (two LDRs before the MOVZ)
@@ -176,10 +189,6 @@ def find_vcp_anchor(data):
                     b_tgt = decode_b_target(w_b, b_co)
                     print("  [+] Patch detected: B at file 0x%06X → skip 0x%06X" %
                           (site.bl_file_off, b_tgt))
-                    # Recover original LDR offsets from before the STP
-                    for pre in [off - 8, off - 4]:
-                        if pre >= code_base:
-                            site.pre_ldr_offsets.append(pre)
                     found_patched = True
                     break
 
@@ -208,6 +217,31 @@ def find_vcp_anchor(data):
         raise RuntimeError("Skip path (STR WZR + STUR XZR with X%d) not found" %
                            site.prot_rn)
 
+    # --- Step 5: find the SMMU programming BL inside the protection function ---
+    # The protection function has two BL calls:
+    #   1st BL: validation/lookup (returns protpgd pointer)
+    #   2nd BL: SMMU hardware programming (uses protpgd)
+    # We replace the 2nd BL with MOVZ W0,#0 so ALL callers skip SMMU config.
+    if site.prot_func_file_off is not None:
+        bl_count = 0
+        for off in range(site.prot_func_file_off, site.prot_func_file_off + 0x80, 4):
+            if off + 4 > len(data):
+                break
+            w = read_u32(data, off)
+            if (w & 0xFC000000) == 0x94000000:  # BL
+                bl_count += 1
+                if bl_count == 2:
+                    site.prot_prog_bl_off = off
+                    prog_co = off - code_base
+                    prog_tgt = decode_bl_target(w, prog_co)
+                    print("  [+] Protection func programming BL at file 0x%06X → 0x%06X" %
+                          (off, prog_tgt))
+                    break
+            elif w == 0xD65F03C0:  # RET
+                break
+        if site.prot_prog_bl_off is None:
+            print("  [!] Warning: could not find programming BL in protection function")
+
     return site
 
 
@@ -215,21 +249,36 @@ def build_patches(data, site):
     """
     Build patch entries: list of (file_offset, original_4bytes, patched_4bytes, desc).
 
-    Patch layout (replacing 5 instructions ending at the BL):
-      BL-16: [LDR]  →  STP XZR, XZR, [Xn, #-16]   (zero protection regs)
-      BL-12: [LDR]  →  NOP
-      BL-8:  MOVZ   →  NOP
-      BL-4:  MOV    →  NOP
-      BL:    BL     →  B <skip_path>
+    Two patch groups:
+      A) Global: inside the protection function, NOP the SMMU programming BL
+         so ALL callers skip actual SMMU hardware configuration.
+      B) VCP handler: replace 5 instructions ending at the BL to skip the
+         protection call entirely and jump to the zero+succeed path.
     """
     code_base = MTK_IMG_HDR_SIZE
     patches = []
 
+    if site.is_patched:
+        raise RuntimeError(
+            "Cannot auto-restore: original BL target address is lost.\n"
+            "  Use the original unpatched tee.img to restore.")
+
+    # --- Group A: Global SMMU programming bypass ---
+    # Replace the programming BL with MOVZ W0, #0 (report success, skip SMMU config)
+    # In this ATF, return 0 = success for the programming sub-function.
+    if site.prot_prog_bl_off is not None:
+        MOVZ_W0_0 = 0x52800000
+        foff = site.prot_prog_bl_off
+        orig_bytes = data[foff:foff + 4]
+        patches.append((foff, orig_bytes, struct.pack('<I', MOVZ_W0_0),
+                         "MOVZ W0, #0 (skip SMMU programming, report success)"))
+
+    # --- Group B: VCP handler skip ---
     stp_word = encode_stp_xzr_xzr(site.prot_rn, (-16 // 8) & 0x7F)
     b_word = encode_b(site.bl_file_off - code_base,
                        site.skip_file_off - code_base)
 
-    offsets_and_descs = [
+    vcp_descs = [
         (site.bl_file_off - 16,
          stp_word,
          "STP XZR, XZR, [X%d, #-16] (zero protect regs)" % site.prot_rn),
@@ -247,22 +296,7 @@ def build_patches(data, site):
          "B 0x%06X (skip to zero+succeed)" % (site.skip_file_off - code_base)),
     ]
 
-    if site.is_patched:
-        # For restore: the "original" is what we want to restore TO,
-        # and "patched" is what's currently there.
-        # We need the original bytes -- they were saved during patching? No.
-        # We can't restore without knowing the original bytes.
-        # BUT: we know the pattern:
-        #   Original[-16]: LDR X?, [X?, #imm] → we stored offsets in pre_ldr_offsets
-        #   Original[-12]: LDR X?, [X?, #imm]
-        #   Original[-8]:  MOVZ W3, #1 = 0x52800023
-        #   Original[-4]:  MOV W2, WZR = 0x2A1F03E2
-        #   Original[0]:   BL <addr> → we can't recover the target!
-        raise RuntimeError(
-            "Cannot auto-restore: original BL target address is lost.\n"
-            "  Use the original unpatched tee.img to restore.")
-
-    for foff, patch_word, desc in offsets_and_descs:
+    for foff, patch_word, desc in vcp_descs:
         orig_bytes = data[foff:foff + 4]
         patches.append((foff, orig_bytes, struct.pack('<I', patch_word), desc))
 
@@ -365,8 +399,8 @@ Detection strategy (device-independent):
             print("[!] Auto-restore is not supported — the original BL target cannot be recovered.")
             print("    To restore, re-flash the original (unpatched) tee.img.")
             return 1
-        print("[*] Patch is already applied. Nothing to do.")
-        print("    To re-flash original, use the unpatched tee.img.")
+        print("[*] Patch already applied. Nothing to do.")
+        print("    To restore, re-flash the original (unpatched) tee.img.")
         return 0
 
     print("[*] Building patch...")
@@ -379,11 +413,17 @@ Detection strategy (device-independent):
     state = verify_state(data, patches)
 
     print()
-    print("  Patch plan (%d instructions):" % len(patches))
+    has_global = site.prot_prog_bl_off is not None
+    print("  Patch plan (%d instructions%s):" % (
+        len(patches), ", 2 layers" if has_global else ""))
     print("  %-12s  %-10s  %-10s  %s" %
           ("File offset", "Original", "Patched", "Description"))
     print("  " + "-" * 72)
-    for foff, orig, patch, desc in patches:
+    if has_global:
+        print("  --- Layer 1: global SMMU programming bypass ---")
+    for i, (foff, orig, patch, desc) in enumerate(patches):
+        if has_global and i == 1:
+            print("  --- Layer 2: VCP handler skip ---")
         actual = data[foff:foff + 4]
         marker = ""
         if actual == patch:
@@ -428,13 +468,15 @@ Detection strategy (device-independent):
         print("[*] Dry run — patch verification passed, not writing.")
         print()
         print("  Effect when applied:")
-        print("    1. Zero SMMU protection registers at [X%d-16 .. X%d-1]" %
-              (site.prot_rn, site.prot_rn))
-        print("    2. Skip BL to protection setup function")
-        print("    3. Jump to existing zero+succeed path")
-        print("    4. VCP init returns success without SMMU protection")
+        print("    Layer 1 (global): SMMU programming function always reports success")
+        print("      → no SMMU hardware configured with empty protpgd for ANY subsystem")
+        print("      → covers iommu_secure init, cmdq, display, and VCP IOMMU banks")
+        print("    Layer 2 (VCP handler): vcp_smc_vcp_init skips protection call")
+        print("      → zeros SMMU protection registers")
+        print("      → jumps to existing zero+succeed path")
+        print("      → VCP init returns success without processing protpgd pointer")
         print()
-        print("  VCP will use only the kernel's M4U IOMMU (no secure SMMU protection).")
+        print("  All devices use only the kernel's M4U IOMMU (no secure SMMU protection).")
         print("  Do NOT use --patch-protpgd with this patch.")
         return 0
 

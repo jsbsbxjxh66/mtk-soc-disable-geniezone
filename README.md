@@ -13,7 +13,7 @@
 | `detect_gz_bypass.py` | 分析 preloader 固件，检测 GPT 修改方案是否可用，推荐无效 LBA 或重名子方案 |
 | `patch_gz_gpt.py` | 修改 GPT 分区表（PGPT）：重名 gz→gx（`--rename`）或将 LBA 指向无效地址（默认） |
 | `detect_lk_gz.py` | 分析 LK 固件，检测并修补 bl2_ext GZ 初始化管线，支持 DTB VCP 节点禁用 |
-| `patch_tee_vcp.py` | 补丁 ATF (tee.img)，跳过 VCP SMMU 保护设置，解决禁用 GZ 后 VCP 崩溃问题 |
+| `patch_tee_vcp.py` | 补丁 ATF (tee.img)，两层跳过 SMMU 保护设置，解决禁用 GZ 后 VCP 崩溃问题 |
 
 ## 两种方案
 
@@ -32,7 +32,7 @@
   - **方案 A** (`--patch-validate`)：补丁 `gz_config_validate` 返回 0，跳过 GZ 初始化
   - **方案 B** (`--patch-init-fail`)：强制 `gz_init_main` 跳转到错误清理路径，触发 `gz_mblock_free_all` 释放内存
 - VCP 修复/禁用（MT6895 等）— 使用 GPT 方案跳过 GZ 后，VCP 子系统因 SMMU 保护页表为空而导致看门狗超时重启：
-  - **ATF VCP 修复** (`patch_tee_vcp.py`，推荐）：补丁 ATF 的 `vcp_smc_vcp_init`，跳过 SMMU 保护设置，零化保护寄存器后走已有的"跳过+成功"路径。VCP 仅使用内核 M4U IOMMU（正常工作），无需 SMMU 保护层。视频硬件编解码不受影响
+  - **ATF VCP 修复** (`patch_tee_vcp.py`，推荐）：两层补丁 ATF。Layer 1 在 SMMU 保护函数内部跳过硬件编程（覆盖所有 5 个调用点：iommu_secure init/cmdq/display/VCP 等），Layer 2 在 `vcp_smc_vcp_init` 中跳过保护调用并走"零化+成功"路径。VCP 仅使用内核 M4U IOMMU（正常工作），无需 SMMU 保护层。视频硬件编解码不受影响
   - **VCP 禁用** (`--patch-vcp`，备用）：将 LK DTB 中所有主 VCP 节点的 `vcp-support=1` 改为 0，同时将 `status="okay"` 改为 `"fail"`，LK 不再加载 VCP 固件，内核 VCP 驱动不 probe，避免 IOMMU 超时。视频硬件编解码不可用
 - 脚本自动检测 LK 中的 bl2_ext GZ 初始化管线和 DTB VCP 节点
 - 部分平台 GPT 方案不可用（如 `halt_on_assert` 被强制置 1 的平台），此时需要 LK 方案
@@ -469,27 +469,31 @@ GZ 被跳过
 
 #### 推荐方案：ATF VCP 补丁 (`patch_tee_vcp.py`)
 
-补丁 ATF 的 `vcp_smc_vcp_init` 函数，跳过 SMMU 保护设置，使用已有的"跳过+成功"代码路径。
+两层补丁 ATF，彻底跳过 SMMU 保护设置。
 
-**原理**：ATF 中 `vcp_smc_vcp_init` 在配置 VCP 时会调用 SMMU 保护设置函数（BL 0x013BA0），该函数查找 protpgd 中的端口保护配置并填写 SMMU 寄存器。当 GZ 被禁用时，protpgd 页表为空，所有 IOVA→PA 映射指向 0x0，导致 translation fault。
+**背景**：ATF 中有一个 SMMU 保护函数（如 0x013BA0），被 5 个不同的 SMC handler 调用（iommu_secure init W3=4、cmdq W3=2、display W3=0、W3=3、VCP W3=1）。该函数内部先做验证/查找（第 1 个 BL），再做 SMMU 硬件编程（第 2 个 BL）。当 GZ 被禁用时，protpgd 页表为空，任何一个调用点触发 SMMU 编程都会导致空页表被加载到硬件。
 
-函数本身已存在一条"跳过"路径（当某些参数为 0 时），该路径零化保护寄存器后返回成功。补丁将保护设置调用替换为直接跳转到此路径：
+内核的 `iommu_secure.ko` 在启动早期（~1.1s）就通过 site1-4 调用保护函数编程 SMMU，远早于 VCP 启动（~7.7s）。因此仅补丁 VCP handler（Layer 2）不够——SMMU 在 VCP 启动前就已被空页表配置。
+
+**两层补丁**：
 
 ```
-原始代码:                          补丁后:
-  MOVZ  W8, #0x38                   MOVZ  W8, #0x38
-  STR   W8, [X24, #0xC]             STR   W8, [X24, #0xC]
-  LDR   X0, [X25, #0x650]           STP   XZR, XZR, [X24, #-16]  ← 零化保护寄存器
-  LDR   X1, [X26, #0x658]           NOP
-  MOVZ  W3, #1                      NOP
-  MOV   W2, WZR                     NOP
-  BL    protection_setup             B     skip_path               ← 跳到零化+返回成功
+Layer 1 (全局): 保护函数内部
+  原始:  BL smmu_programming    ; 第 2 个 BL，执行 SMMU 硬件编程
+  补丁:  MOVZ W0, #0            ; 返回成功，跳过硬件编程
+  效果:  所有 5 个调用点都不会编程 SMMU 硬件
 
-skip_path:                         skip_path:
-  STR   WZR, [X24, #0]              STR   WZR, [X24, #0]          (已有代码)
-  STUR  XZR, [X24, #4]              STUR  XZR, [X24, #4]
-  ... (cache flush, 返回成功)         ... (cache flush, 返回成功)
+Layer 2 (VCP handler): vcp_smc_vcp_init 内部
+  原始:                          补丁后:
+    LDR   X0, [X25, #0x650]       STP   XZR, XZR, [X24, #-16]  ← 零化保护寄存器
+    LDR   X1, [X26, #0x658]       NOP
+    MOVZ  W3, #1                   NOP
+    MOV   W2, WZR                  NOP
+    BL    protection_func           B     skip_path               ← 跳到零化+返回成功
+  效果:  VCP handler 完全不处理 protpgd 指针
 ```
+
+Layer 1 单独即可阻止 SMMU 被空页表配置，Layer 2 进一步确保 VCP handler 不处理无效的 protpgd 数据。
 
 > **优势**：VCP 保持完整功能，视频硬件编解码正常工作。仅使用内核 M4U IOMMU（无 SMMU 保护层，GZ 禁用时可接受）。脚本使用模式匹配定位补丁点，不依赖固定偏移，具备跨固件版本通用性。
 
@@ -540,7 +544,7 @@ skip_path:                         skip_path:
 
 ## patch_tee_vcp.py
 
-补丁 MTK ATF (tee.img)，跳过 `vcp_smc_vcp_init` 中的 SMMU 保护设置。适用于 GPT 方案禁用 GZ 后 VCP 因空 SMMU 保护页表崩溃的平台（如 MT6895）。
+两层补丁 MTK ATF (tee.img)，跳过 SMMU 保护设置。适用于 GPT 方案禁用 GZ 后 VCP 因空 SMMU 保护页表崩溃的平台（如 MT6895）。
 
 ### 检测流程
 
@@ -548,6 +552,7 @@ skip_path:                         skip_path:
 2. **锚点匹配** — 在函数代码范围内查找 `MOVZ Wn, #0x38` + `STR Wn, [Xm, #0xC]`（VCP MMIO 寄存器写入），提取保护寄存器基址寄存器号
 3. **调用点定位** — 从锚点向前搜索 `MOVZ W3, #1; MOV W2, WZR; BL` 原始模式或 `STP XZR,XZR; NOP; NOP; NOP; B` 已补丁模式
 4. **跳过路径定位** — 搜索 `STR WZR, [Xm, #0]; STUR XZR, [Xm, #4]` 零化+返回成功路径
+5. **保护函数编程 BL 定位** — 从 VCP handler 的 BL 目标地址进入保护函数，找到第 2 个 BL（SMMU 硬件编程调用）
 
 ### 用法
 
@@ -567,7 +572,15 @@ python3 patch_tee_vcp.py tee_patched.img --dry-run
 
 ### 补丁内容
 
-5 条指令替换（20 字节），不改变文件大小：
+6 条指令替换（24 字节），不改变文件大小：
+
+**Layer 1（全局 SMMU 编程旁路）：**
+
+| 原始指令 | 补丁后 | 说明 |
+|---------|--------|------|
+| `BL smmu_programming` | `MOVZ W0, #0` | 保护函数内第 2 个 BL → 返回成功，跳过 SMMU 硬件编程 |
+
+**Layer 2（VCP handler 跳过）：**
 
 | 原始指令 | 补丁后 | 说明 |
 |---------|--------|------|
@@ -575,7 +588,7 @@ python3 patch_tee_vcp.py tee_patched.img --dry-run
 | `LDR X1, [X26, #imm]` | `NOP` | |
 | `MOVZ W3, #1` | `NOP` | |
 | `MOV W2, WZR` | `NOP` | |
-| `BL protection_setup` | `B skip_path` | 跳转到已有零化+成功路径 |
+| `BL protection_func` | `B skip_path` | 跳转到已有零化+成功路径 |
 
 ### 注意事项
 
@@ -613,10 +626,14 @@ BROM → preloader (签名验证) → ATF → LK → kernel
               │  配置 NoGZ 标志   │       │   vcp-support=0 或 status≠"okay" → 跳过
               ├─ 分区加载循环     │       └─ DTB: trusty-gz / nebula / vcp 节点 → kernel
               └─ ATF 跳转        │
+                                 ├─ SMMU 保护函数 (被 5 个 SMC handler 调用):
+                                 │   iommu_secure init (W3=4), cmdq (W3=2),
+                                 │   display (W3=0), W3=3, VCP (W3=1)
+                                 │   内部: 验证/查找 BL → SMMU 编程 BL
+                                 │   GZ 跳过时 protpgd 为空 → DMA PA=0x0 → fault
+                                 │   patch_tee_vcp.py Layer 1: 编程 BL → MOVZ W0,#0
                                  ├─ vcp_smc_vcp_init:
-                                 │   配置 SMMU 保护寄存器 (查找 protpgd 页表)
-                                 │   GZ 跳过时页表为空 → DMA PA=0x0 → fault
-                                 │   patch_tee_vcp.py: 跳过保护设置 → 走零化+成功路径
+                                 │   patch_tee_vcp.py Layer 2: 跳过保护调用 → 零化+成功
                                  └─ VCP 仅使用内核 M4U IOMMU (正常工作)
 ```
 
@@ -774,24 +791,29 @@ vcp: watchdog timeout
   bl2_ext 分配 protpgd mblock (2MB) → 全零
   ATF 映射 protpgd 到 VA 空间
   GZ 启动后填充 protpgd 页表项 (IOVA → PA 映射)     ← 关键步骤
-  内核启动 → VCP 驱动 → SMC vcp_smc_vcp_init
-  ATF 用 protpgd 中的映射配置 SMMU 保护寄存器
+  内核启动 → iommu_secure.ko → SMC 调用保护函数 (site1-4)
+  ATF 用 protpgd 中的映射配置 SMMU (有效页表项)
+  VCP 驱动 → SMC vcp_smc_vcp_init (site5)
+  ATF 配置 VCP SMMU 保护寄存器
   VCP DMA → SMMU 查 protpgd → 正确 PA → 正常工作 ✓
 
 异常流程 (GZ 禁用, 未打 ATF 补丁):
   bl2_ext 分配 protpgd mblock (2MB) → 全零
   ATF 映射 protpgd 到 VA 空间
   GZ 未启动 → protpgd 页表项全为 0                   ← 根因
-  内核启动 → VCP 驱动 → SMC vcp_smc_vcp_init
-  ATF 用空 protpgd 配置 SMMU 保护寄存器 → 所有映射指向 PA=0x0
+  内核启动 (~1.1s) → iommu_secure.ko → SMC 调用保护函数 (site1-4)
+  ATF 用空 protpgd 编程 SMMU → 所有映射指向 PA=0x0   ← 早于 VCP 启动
+  VCP 启动 (~7.7s) → SMC vcp_smc_vcp_init (site5)
+  ATF 再次用空 protpgd 配置 VCP SMMU
   VCP DMA → SMMU 查 protpgd → PA=0x0 → translation fault
   VCP 看门狗超时 → WDT reset → 循环重启 ✗
 
-修复后流程 (GZ 禁用, 已打 ATF 补丁):
-  ATF vcp_smc_vcp_init 被补丁:
-    跳过 SMMU 保护设置 (不读 protpgd)
-    零化保护寄存器 (STP XZR,XZR + skip path)
-    返回成功
+修复后流程 (GZ 禁用, 已打两层 ATF 补丁):
+  Layer 1: 保护函数内部 SMMU 编程 BL → MOVZ W0,#0
+    → 所有 5 个调用点 (iommu_secure/cmdq/display/VCP 等) 都不编程 SMMU 硬件
+  Layer 2: vcp_smc_vcp_init 跳过保护调用
+    → 零化保护寄存器 (STP XZR,XZR + skip path)
+    → 返回成功
   VCP 仅使用内核 M4U IOMMU → 正常工作 ✓
 ```
 
@@ -822,10 +844,11 @@ vcp: watchdog timeout
 
 **补丁后仍然 60 秒重启**
 
-1. 确认 tee.img 已正确刷入（对比文件大小和 md5）
-2. 确认签名验证已被绕过（否则补丁后的 tee.img 会被拒绝加载，设备可能回退到 ROM 中的原始 ATF）
-3. 确认 GPT 补丁仍然有效（OTA 可能还原了 GPT）
-4. 可能存在其他 IOMMU 保护问题（非 VCP 端口），需进一步分析日志
+1. 确认使用的是最新版 `patch_tee_vcp.py`（两层补丁，6 条指令）。旧版只补丁 VCP handler（Layer 2），不够——iommu_secure.ko 在 VCP 启动前就通过其他调用点编程了 SMMU
+2. 确认从原始未补丁的 tee.img 打补丁（不要在已部分补丁的文件上操作）
+3. 确认 tee.img 已正确刷入（对比文件大小和 md5）
+4. 确认签名验证已被绕过（否则补丁后的 tee.img 会被拒绝加载，设备可能回退到 ROM 中的原始 ATF）
+5. 确认 GPT 补丁仍然有效（OTA 可能还原了 GPT）
 
 **补丁后视频编解码异常**
 
