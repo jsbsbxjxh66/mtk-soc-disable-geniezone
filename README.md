@@ -485,12 +485,13 @@ Layer 1 (全局): 保护函数内部
 
 Layer 2 (VCP handler): vcp_smc_vcp_init 内部
   原始:                          补丁后:
-    LDR   X0, [X25, #0x650]       STP   XZR, XZR, [X24, #-16]  ← 零化保护寄存器
+    LDR   X0, [X25, #0x650]       NOP
     LDR   X1, [X26, #0x658]       NOP
     MOVZ  W3, #1                   NOP
     MOV   W2, WZR                  NOP
     BL    protection_func           B     skip_path               ← 跳到零化+返回成功
   效果:  VCP handler 完全不处理 protpgd 指针
+         skip_path 零化保护寄存器 [X24,#0] 和 [X24,#4] 后返回成功
 ```
 
 Layer 1 单独即可阻止 SMMU 被空页表配置，Layer 2 进一步确保 VCP handler 不处理无效的 protpgd 数据。
@@ -550,7 +551,7 @@ Layer 1 单独即可阻止 SMMU 被空页表配置，Layer 2 进一步确保 VCP
 
 1. **字符串定位** — 搜索 `vcp_smc_vcp_init` 字符串作为近距离参考
 2. **锚点匹配** — 在函数代码范围内查找 `MOVZ Wn, #0x38` + `STR Wn, [Xm, #0xC]`（VCP MMIO 寄存器写入），提取保护寄存器基址寄存器号
-3. **调用点定位** — 从锚点向前搜索 `MOVZ W3, #1; MOV W2, WZR; BL` 原始模式或 `STP XZR,XZR; NOP; NOP; NOP; B` 已补丁模式
+3. **调用点定位** — 从锚点向前搜索 `MOVZ W3, #1; MOV W2, WZR; BL` 原始模式或 `NOP; NOP; NOP; NOP; B` 已补丁模式
 4. **跳过路径定位** — 搜索 `STR WZR, [Xm, #0]; STUR XZR, [Xm, #4]` 零化+返回成功路径
 5. **保护函数编程 BL 定位** — 从 VCP handler 的 BL 目标地址进入保护函数，找到第 2 个 BL（SMMU 硬件编程调用）
 
@@ -584,11 +585,11 @@ python3 patch_tee_vcp.py tee_patched.img --dry-run
 
 | 原始指令 | 补丁后 | 说明 |
 |---------|--------|------|
-| `LDR X0, [X25, #imm]` | `STP XZR, XZR, [Xn, #-16]` | 零化保护寄存器 (16 字节) |
+| `LDR X0, [X25, #imm]` | `NOP` | 跳过参数加载 |
 | `LDR X1, [X26, #imm]` | `NOP` | |
 | `MOVZ W3, #1` | `NOP` | |
 | `MOV W2, WZR` | `NOP` | |
-| `BL protection_func` | `B skip_path` | 跳转到已有零化+成功路径 |
+| `BL protection_func` | `B skip_path` | 跳转到已有零化+成功路径（skip_path 零化保护寄存器并返回成功） |
 
 ### 注意事项
 
@@ -812,7 +813,7 @@ vcp: watchdog timeout
   Layer 1: 保护函数内部 SMMU 编程 BL → MOVZ W0,#0
     → 所有 5 个调用点 (iommu_secure/cmdq/display/VCP 等) 都不编程 SMMU 硬件
   Layer 2: vcp_smc_vcp_init 跳过保护调用
-    → 零化保护寄存器 (STP XZR,XZR + skip path)
+    → 跳到 skip_path 零化保护寄存器并返回成功
     → 返回成功
   VCP 仅使用内核 M4U IOMMU → 正常工作 ✓
 ```

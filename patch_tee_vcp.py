@@ -66,10 +66,6 @@ def encode_b(src_code_off, dst_code_off):
     return 0x14000000 | (offset & 0x03FFFFFF)
 
 
-def encode_stp_xzr_xzr(rn, simm7):
-    """STP XZR, XZR, [Xn, #simm7*8] signed-offset form."""
-    return 0xA9000000 | ((simm7 & 0x7F) << 15) | (31 << 10) | (rn << 5) | 31
-
 
 class PatchSite:
     """Describes a located VCP SMMU protection patch site."""
@@ -143,9 +139,7 @@ def find_vcp_anchor(data):
     # --- Step 3: search forward for protection BL or patched B ---
     # Look for either:
     #   Original: LDR; LDR; MOVZ W3,#1; MOV W2,WZR; BL; CBZ X0
-    #   Patched:  STP XZR,XZR,[Xn,#-16]; NOP; NOP; NOP; B
-    stp_expected = encode_stp_xzr_xzr(site.prot_rn, (-16 // 8) & 0x7F)
-
+    #   Patched:  NOP; NOP; NOP; NOP; B
     found_original = False
     found_patched = False
     scan_start = site.anchor_off + 4
@@ -176,11 +170,12 @@ def find_vcp_anchor(data):
                         found_original = True
                         break
 
-        # Check for patched pattern: STP XZR,XZR,[Xn,#-16]
-        if w == stp_expected and not found_patched:
-            if (read_u32(data, off + 4) == NOP and
-                read_u32(data, off + 8) == NOP and
-                read_u32(data, off + 12) == NOP):
+        # Check for patched pattern: 4 NOPs + B (or old STP + 3 NOPs + B)
+        if not found_patched:
+            has_tail = (read_u32(data, off + 4) == NOP and
+                        read_u32(data, off + 8) == NOP and
+                        read_u32(data, off + 12) == NOP)
+            if has_tail and (w == NOP or (w & 0xFF000000) == 0xA9000000):
                 w_b = read_u32(data, off + 16)
                 if (w_b & 0xFC000000) == 0x14000000:
                     site.bl_file_off = off + 16
@@ -274,23 +269,26 @@ def build_patches(data, site):
                          "MOVZ W0, #0 (skip SMMU programming, report success)"))
 
     # --- Group B: VCP handler skip ---
-    stp_word = encode_stp_xzr_xzr(site.prot_rn, (-16 // 8) & 0x7F)
+    # Replace 4 arg-setup instructions + BL with NOPs + B to skip_path.
+    # skip_path already zeros the protection registers and returns success.
+    # NOTE: do NOT use STP here -- X24 points to MMIO at non-8-byte-aligned
+    # address (e.g. 0x1EA00014), causing alignment fault in EL3.
     b_word = encode_b(site.bl_file_off - code_base,
                        site.skip_file_off - code_base)
 
     vcp_descs = [
         (site.bl_file_off - 16,
-         stp_word,
-         "STP XZR, XZR, [X%d, #-16] (zero protect regs)" % site.prot_rn),
+         NOP,
+         "NOP (was LDR X0)"),
         (site.bl_file_off - 12,
          NOP,
-         "NOP"),
+         "NOP (was LDR X1)"),
         (site.bl_file_off - 8,
          NOP,
-         "NOP"),
+         "NOP (was MOVZ W3)"),
         (site.bl_file_off - 4,
          NOP,
-         "NOP"),
+         "NOP (was MOV W2)"),
         (site.bl_file_off,
          b_word,
          "B 0x%06X (skip to zero+succeed)" % (site.skip_file_off - code_base)),
