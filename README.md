@@ -1,6 +1,6 @@
 # mtk-soc-disable-geniezone
 
-禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。LK 方案支持 bl2_ext GZ 初始化管线补丁和 DTB VCP 节点禁用。ATF 方案支持三层补丁：SMMU 保护跳过 + VCP handler 旁路 + DEVMPU 重置（清除 preloader 设置的所有硬件访问限制）。
+禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。LK 方案支持 bl2_ext GZ 初始化管线补丁和 DTB VCP 节点禁用。ATF 方案支持三层补丁：SMMU 保护跳过 + VCP handler 旁路 + DEVMPU 重置（清除 preloader 设置的所有硬件访问限制）。VCP 禁用方案需同时修补 LK DTB 和 vendor_boot DTB（内核设备树）。
 
 > **免责声明**
 >
@@ -14,6 +14,7 @@
 | `patch_gz_gpt.py` | 修改 GPT 分区表（PGPT）：重名 gz→gx（`--rename`）或将 LBA 指向无效地址（默认） |
 | `detect_lk_gz.py` | 分析 LK 固件，检测并修补 bl2_ext GZ 初始化管线，支持 DTB VCP 节点禁用 |
 | `patch_tee_vcp.py` | 补丁 ATF (tee.img)，三层补丁：跳过 SMMU 保护设置 + DEVMPU 重置，解决禁用 GZ 后 VCP 崩溃和 DEVMPU 违规问题 |
+| `patch_vendor_boot.py` | 修补 vendor_boot.img 中的内核设备树，禁用 VCP 驱动 probe（配合 `--patch-vcp` 使用） |
 
 ## 两种方案
 
@@ -23,7 +24,7 @@
 | **GPT 无效 LBA 方案** | Preloader | `halt_on_assert` 未被强制置 1 | 否 |
 | **LK bl2_ext 方案** | LK (bl2_ext 段) | bl2_ext 中存在 GZ 初始化管线 | 是 |
 | **ATF VCP 修复** | ATF (tee.img) | ATF 中存在 vcp_smc_vcp_init 函数和 DEVMPU 初始化函数 | 是 |
-| **VCP 禁用** | LK (DTB) | LK 中 DTB 存在 vcp-support 节点 | 是 |
+| **VCP 禁用** | LK (DTB) + vendor_boot (DTB) | DTB 中存在 vcp-support 节点 | 是 |
 
 - GPT 方案有两个子方案，均不修改代码：
   - **重名方案** (`--rename`)：将 gz 分区改名为 gx，`get_part_info("gz")` 找不到分区 → 无 I/O → 设置 NoGZ。需 preloader 主引导循环不独立依赖 gz 分区名解析（`detect_gz_bypass.py` 自动检测）
@@ -33,10 +34,10 @@
   - **方案 B** (`--patch-init-fail`)：强制 `gz_init_main` 跳转到错误清理路径，触发 `gz_mblock_free_all` 释放内存
 - VCP 修复/禁用（MT6895 等）— 使用 GPT 方案跳过 GZ 后，VCP 子系统因 SMMU 保护页表为空而导致看门狗超时重启，以及 DEVMPU 域7访问违规洪泛：
   - **ATF VCP 修复** (`patch_tee_vcp.py`，推荐）：三层补丁 ATF。Layer 1 在 SMMU 保护函数内部跳过硬件编程（覆盖所有 5 个调用点），Layer 2 在 `vcp_smc_vcp_init` 中跳过保护调用并走"零化+成功"路径，Layer 3 在 DEVMPU init 函数中注入 devmpu_reset 调用（通过 code cave 中的 trampoline），在 DEVMPU 启用前写入 reset 命令（7→1）到控制寄存器 `0x10351104`/`0x10355104`，清除 preloader 设置的所有 DEVMPU APC（Access Permission Control）限制。VCP 仅使用内核 M4U IOMMU（正常工作），无需 SMMU 保护层。视频硬件编解码不受影响
-  - **VCP 禁用** (`--patch-vcp`，备用）：将 LK DTB 中所有主 VCP 节点的 `vcp-support=1` 改为 0，同时将 `status="okay"` 改为 `"fail"`，LK 不再加载 VCP 固件，内核 VCP 驱动不 probe，避免 IOMMU 超时。视频硬件编解码不可用
+  - **VCP 禁用** (`--patch-vcp` + `patch_vendor_boot.py`，备用）：将 LK DTB 和 vendor_boot DTB 中所有主 VCP 节点的 `vcp-support=1` 改为 0，`status="okay"` 改为 `"fail"`。LK 不加载 VCP 固件，内核 VCP 驱动不 probe，避免 IOMMU 超时。需同时修改两个镜像（LK 控制固件加载，vendor_boot 控制内核驱动 probe）。视频硬件编解码不可用
 - 脚本自动检测 LK 中的 bl2_ext GZ 初始化管线和 DTB VCP 节点
 - 部分平台 GPT 方案不可用（如 `halt_on_assert` 被强制置 1 的平台），此时需要 LK 方案
-- 部分平台使用 GPT 方案跳过 GZ 后需处理 VCP 问题：GZ 负责填充 SMMU 保护页表（protpgd）的页表项，跳过 GZ 后页表为空，VCP DMA 映射到 PA=0x0 触发 IOMMU translation fault → 60 秒看门狗超时重启。此外，DEVMPU（Device Memory Protection Unit）的域7（VCP/APU）访问限制由 preloader 设置，正常情况下 VCP 通过 GZ 代理访问受保护内存，跳过 GZ 后 VCP 直接访问被 DEVMPU 拒绝，导致 DEVMPU 违规洪泛（约启动后 33 秒触发 12000+ 次违规 → IRQ 风暴 → HWT 崩溃）。推荐使用 `patch_tee_vcp.py` 三层补丁 ATF（跳过 SMMU 保护 + DEVMPU 重置，保留 VCP 功能），或使用 `--patch-vcp` 禁用 VCP
+- 部分平台使用 GPT 方案跳过 GZ 后需处理 VCP 问题：GZ 负责填充 SMMU 保护页表（protpgd）的页表项，跳过 GZ 后页表为空，VCP DMA 映射到 PA=0x0 触发 IOMMU translation fault → 60 秒看门狗超时重启。此外，DEVMPU（Device Memory Protection Unit）的域7（VCP/APU）访问限制由 preloader 设置，正常情况下 VCP 通过 GZ 代理访问受保护内存，跳过 GZ 后 VCP 直接访问被 DEVMPU 拒绝，导致 DEVMPU 违规洪泛（约启动后 33 秒触发 12000+ 次违规 → IRQ 风暴 → HWT 崩溃）。推荐使用 `patch_tee_vcp.py` 三层补丁 ATF（跳过 SMMU 保护 + DEVMPU 重置，保留 VCP 功能），或使用 `detect_lk_gz.py --patch-vcp` + `patch_vendor_boot.py` 禁用 VCP（需同时修补 LK 和 vendor_boot 两个镜像的 DTB）
 - MT6991 等新式平台 GPT 方案不可用：preloader 不再负责加载 GZ，GZ 加载由 bl2_ext 执行。修改 GPT 后设备能进 fastboot，但无法正常启动——bl2_ext 的 `gz_init_main` 会在分区加载失败前执行不可逆的硬件配置（内存重映射、mblock 分配等），cleanup 无法完全逆转这些变更。需使用 LK bl2_ext 方案
 
 ## 快速开始
@@ -170,12 +171,17 @@ python3 detect_lk_gz.py lk.img --patch-init-fail
 python3 detect_lk_gz.py lk.img --patch-validate --patch-init-fail
 ```
 
-VCP 禁用（`--patch-vcp`，仅在 ATF 补丁不可用时使用）：
+VCP 禁用（`--patch-vcp` + `patch_vendor_boot.py`，仅在 ATF 补丁不可用时使用）：
 
 ```bash
-# 禁用 DTB 中的 VCP (vcp-support=1→0, status="okay"→"fail")
+# 步骤 1: 禁用 LK DTB 中的 VCP (LK 不加载 VCP 固件)
 python3 detect_lk_gz.py lk.img --patch-vcp
+
+# 步骤 2: 禁用 vendor_boot DTB 中的 VCP (内核 VCP 驱动不 probe)
+python3 patch_vendor_boot.py vendor_boot.img
 ```
+
+> **重要**：两步都要做。LK DTB 控制 bootloader 是否加载 VCP 固件，vendor_boot DTB 控制内核 VCP 驱动是否 probe。只改 LK 不改 vendor_boot 会导致内核仍然尝试使用 VCP。
 
 ### 方案三：ATF VCP 修复（配合 GPT 方案使用）
 
@@ -524,15 +530,23 @@ Layer 1 单独即可阻止 SMMU 被空页表配置，Layer 2 进一步确保 VCP
 
 > **注意**：此补丁与 `--patch-protpgd` 互斥。使用此补丁后 protpgd mblock 不再被访问，无需通过 bl2_ext 分配。
 
-#### 备用方案：VCP 禁用 (`--patch-vcp`)
+#### 备用方案：VCP 禁用 (`--patch-vcp` + `patch_vendor_boot.py`)
 
-修改 LK 内嵌 DTB 中主 VCP 节点（`vcp@1ec00000`）的两个属性，完全禁用 VCP：
+完全禁用 VCP 需要修改两个镜像中的 DTB：
 
-- 扫描 LK 镜像中所有 FDT blob（通过 FDT magic `0xD00DFEED`）
+1. **LK DTB**（`detect_lk_gz.py --patch-vcp`）：LK 的 `app_load_vcp()` 读取 DTB，`vcp-support=0` 时不加载 VCP 固件
+2. **vendor_boot DTB**（`patch_vendor_boot.py`）：内核 VCP 驱动读取此 DTB，`status="fail"` 时不 probe
+
+两步缺一不可：
+- 只改 LK → LK 不加载 VCP 固件，但内核驱动仍 probe VCP 硬件 → 异常
+- 只改 vendor_boot → 内核不 probe，但 LK 可能已加载了 VCP 固件到 SRAM → 资源浪费
+
+每个镜像的修改内容：
+- 扫描镜像中所有 FDT blob（通过 FDT magic `0xD00DFEED`）
 - 定位 `vcp@*` 节点下的 `vcp-support` 和 `status` 属性
-- 将 `vcp-support = <0x01>` 修改为 `<0x00>`：LK 的 `app_load_vcp()` 读取 DTB，值为 0 时不加载 VCP 固件
-- 将 `status = "okay"` 修改为 `"fail"`：内核 VCP 驱动不 probe，不发起 VCP SMC 调用
-- `vcp_iommu_*` 子节点无 `status` 属性，无需修改（主 VCP 禁用后子节点不会工作）
+- 将 `vcp-support = <0x01>` 修改为 `<0x00>`
+- 将 `status = "okay"` 修改为 `"fail"`
+- `vcp_iommu_*` 子节点（`vcp-support=2~6`）无 `status` 属性，无需修改（主 VCP 禁用后子节点不被消费）
 
 > **注意**：`"fail"` 与 `"okay"` 同为 5 字节（含 \0），不改变 FDT 结构；`"disabled"` 为 9 字节，无法原地替换。`"fail"` 是设备树规范定义的标准状态值，内核 `of_device_is_available()` 对非 `"okay"` 的值一律返回 false，效果等同 `"disabled"`。
 
@@ -653,6 +667,70 @@ Trampoline（写入 code cave 的零字节区域）：
 
 ---
 
+## patch_vendor_boot.py
+
+修补 vendor_boot.img 中的内核设备树，禁用 VCP 驱动 probe。Android GKI 设备的内核 DTB 嵌在 vendor_boot.img（VNDRBOOT v3/v4 格式）中，与 LK 中的 DTB 是独立的两份。
+
+### 背景
+
+MTK 平台的 VCP 禁用需要修改两个层面的设备树：
+
+| 层面 | 镜像 | 作用 | 工具 |
+|------|------|------|------|
+| Bootloader (LK) | lk.img | 控制 LK 是否加载 VCP 固件 | `detect_lk_gz.py --patch-vcp` |
+| 内核 | vendor_boot.img | 控制内核 VCP 驱动是否 probe | `patch_vendor_boot.py` |
+
+只改 LK DTB 时，LK 不加载 VCP 固件，但内核的 VCP 驱动仍然看到 `status="okay"` 会 probe，导致 VCP 子系统部分初始化后因缺少固件而异常。
+
+### 用法
+
+```bash
+# 分析 vendor_boot.img（显示 DTB 信息和 VCP 节点状态）
+python3 patch_vendor_boot.py vendor_boot.img --dry-run
+
+# 修补（自动备份原始文件）
+python3 patch_vendor_boot.py vendor_boot.img
+
+# 指定输出文件
+python3 patch_vendor_boot.py vendor_boot.img -o vendor_boot_patched.img
+
+# 从备份还原
+python3 patch_vendor_boot.py vendor_boot.img --restore
+```
+
+### 修补内容
+
+- 扫描 vendor_boot.img 中所有 FDT blob（通过 FDT magic `0xD00DFEED`）
+- 定位主 VCP 节点（`vcp-support=1`），将其改为 `vcp-support=0`
+- 将 `status="okay"` 改为 `"fail"`（等长替换，不改变 FDT 结构）
+- `vcp_iommu_*` 子节点（`vcp-support=2~6`）无需修改，主节点禁用后子节点不被消费
+
+### 特性
+
+- 自动检测 VNDRBOOT 格式版本（v3/v4）
+- 支持多 DTB（vendor_boot v4 可嵌多个 DTB）
+- 幂等：对已禁用的镜像重复运行会提示"无需修补"
+- 自动备份原始文件（`*_backup.*`）
+- 支持 `--restore` 还原
+
+### 完整 VCP 禁用流程
+
+```bash
+# 1. 禁用 LK DTB 中的 VCP
+python3 detect_lk_gz.py lk.img --patch-vcp
+# 输出: lk_patched.img
+
+# 2. 禁用 vendor_boot DTB 中的 VCP
+python3 patch_vendor_boot.py vendor_boot.img
+# 输出: vendor_boot_patched.img
+
+# 3. 刷入两个修补后的镜像
+fastboot flash lk lk_patched.img
+fastboot flash vendor_boot vendor_boot_patched.img
+```
+
+---
+
 ## 原理
 
 ### 启动流程中的 GenieZone
@@ -674,15 +752,20 @@ BROM → preloader (签名验证) → ATF → LK → kernel
 
 ```
 BROM → preloader (签名验证) → ATF → LK → kernel
-              │                  │       │
-              ├─ gz_init():      │       ├─ app_load_vcp(): 读取 DTB
-              │  读取 gz 分区     │       │   vcp-support=1 + status="okay" → 加载 VCP
-              │  配置 NoGZ 标志   │       │   vcp-support=0 或 status≠"okay" → 跳过
-              ├─ DEVMPU APC:     │       └─ DTB: trusty-gz / nebula / vcp 节点 → kernel
-              │  preloader 编程   │
-              │  域7限制          │
-              ├─ 分区加载循环     │
-              └─ ATF 跳转        │
+              │                  │       │       │
+              ├─ gz_init():      │       │       ├─ VCP 驱动 probe:
+              │  读取 gz 分区     │       │       │   读取 vendor_boot DTB
+              │  配置 NoGZ 标志   │       │       │   status="okay" → probe VCP
+              ├─ DEVMPU APC:     │       │       │   status="fail" → 跳过
+              │  preloader 编程   │       │       │   patch_vendor_boot.py: 改 DTB
+              │  域7限制          │       │       └─ DTB: trusty-gz / nebula 节点
+              ├─ 分区加载循环     │       │
+              └─ ATF 跳转        │       ├─ app_load_vcp(): 读取 LK DTB
+                                 │       │   vcp-support=1 → 加载 VCP 固件
+                                 │       │   vcp-support=0 → 跳过
+                                 │       │   detect_lk_gz.py --patch-vcp: 改 LK DTB
+                                 │       └─ DTB: vcp 节点 → 仅影响 LK 阶段
+                                 │
                                  ├─ SMMU 保护函数 (被 5 个 SMC handler 调用):
                                  │   GZ 跳过时 protpgd 为空 → DMA PA=0x0 → fault
                                  │   patch_tee_vcp.py Layer 1: 编程 BL → MOVZ W0,#0
@@ -888,7 +971,7 @@ vcp: watchdog timeout
 | 方案 | 工具 | 效果 | 适用场景 |
 |------|------|------|---------|
 | **ATF 补丁**（推荐） | `patch_tee_vcp.py tee.img` | 跳过 SMMU 保护 + DEVMPU 重置，VCP 正常工作 | 有 tee.img 且能绕过签名 |
-| **VCP 禁用**（备用） | `detect_lk_gz.py lk.img --patch-vcp` | 完全禁用 VCP，无 IOMMU 调用 | ATF 补丁不可用时 |
+| **VCP 禁用**（备用） | `detect_lk_gz.py --patch-vcp` + `patch_vendor_boot.py` | 完全禁用 VCP，无 IOMMU 调用 | ATF 补丁不可用时 |
 
 #### 诊断步骤
 
@@ -976,7 +1059,7 @@ emi_mpu: violation - domain 7, region 10, master 0x2C06
 - **LK 签名**：LK 方案修改了代码/数据，需要不校验签名的 preloader 或 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名
 - **处理器代际差异**：
   - 天玑 v5 及以下（如 MT6833/MT6893）：GPT LBA 方案通常直接可用，LK 无 GZ 代码不需要 LK 方案
-  - 天玑 v6（如 MT6895）：GPT 方案跳过 GZ 后需配合 `patch_tee_vcp.py` 三层补丁 ATF（推荐）或 `--patch-vcp` 修复 VCP 问题，否则 VCP SMMU 保护页表为空导致 IOMMU translation fault → 60 秒看门狗重启，以及 DEVMPU 域7违规洪泛 → 约 33 秒 HWT 崩溃
+  - 天玑 v6（如 MT6895）：GPT 方案跳过 GZ 后需配合 `patch_tee_vcp.py` 三层补丁 ATF（推荐）或 `--patch-vcp` + `patch_vendor_boot.py` 禁用 VCP，否则 VCP SMMU 保护页表为空导致 IOMMU translation fault → 60 秒看门狗重启，以及 DEVMPU 域7违规洪泛 → 约 33 秒 HWT 崩溃
   - 天玑 v6+（如 MT6991）：GPT 方案不可用（修改 GPT 后能进 fastboot 但无法正常启动，bl2_ext 中 GZ 初始化的部分执行导致不可逆硬件配置变更），需使用 bl2_ext 方案（`--patch-validate` / `--patch-init-fail`）
   - 或使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 高级用法直接干掉 GenieZone
 - **功能影响**：禁用 GenieZone 后，依赖 GZ 虚拟化服务的功能（如部分 DRM、安全容器等）可能不可用；禁用 VCP 后，硬件视频编解码加速等功能可能不可用或回退到软件实现
