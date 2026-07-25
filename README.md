@@ -13,7 +13,7 @@
 | `detect_gz_bypass.py` | 分析 preloader 固件，检测 GPT 修改方案是否可用，推荐无效 LBA 或重名子方案 |
 | `patch_gz_gpt.py` | 修改 GPT 分区表（PGPT）：重名 gz→gx（`--rename`）或将 LBA 指向无效地址（默认） |
 | `detect_lk_gz.py` | 分析 LK 固件，检测并修补 bl2_ext GZ 初始化管线，支持 DTB VCP 节点禁用 |
-| `patch_tee_vcp.py` | 补丁 ATF (tee.img)，三层补丁：跳过 SMMU 保护设置 + DEVMPU 重置，解决禁用 GZ 后 VCP 崩溃和 DEVMPU 违规问题 |
+| `patch_tee_vcp.py` | 补丁 ATF (tee.img)，支持两种方案：bank 表补丁 (`--patch-bank-table`, 实验性) 或三层补丁（默认, 已验证），解决禁用 GZ 后 VCP 崩溃和 DEVMPU 违规问题 |
 | `patch_vendor_boot.py` | 修补 vendor_boot.img 中的内核设备树，禁用 VCP 驱动 probe（配合 `--patch-vcp` 使用） |
 
 ## 两种方案
@@ -477,9 +477,30 @@ GZ 被跳过
   → 12000+ 次 DEVMPU 违规 → IRQ 风暴 → 约 33 秒后 HWT 崩溃
 ```
 
-提供两种解决方案：
+提供三种解决方案：
 
-#### 推荐方案：ATF VCP 补丁 (`patch_tee_vcp.py`)
+#### ATF VCP 方案对比
+
+| | 方案 A: `--patch-bank-table` (实验性) | 方案 B: 三层补丁 (默认, 已验证) | 方案 C: VCP 禁用 |
+|---|---|---|---|
+| **原理** | 改 ATF bank 表 mem_type, 让所有 domain 走 PROTECT 路径 | 绕过安全 SMMU + 跳过 VCP 保护 + 重置 DEVMPU | 关闭 VCP 驱动 probe |
+| **改动量** | 6 字节 (数据表) | 22 条指令 + 蹦床代码 | DTB 属性修改 (两个镜像) |
+| **SMMU 保护** | ✅ 保留 (ATF 正常编程 HW) | ❌ 完全绕过 | N/A (VCP 不启动) |
+| **VCP 功能** | ✅ 完整 (视频编解码正常) | ✅ 完整 (视频编解码正常) | ❌ 不可用 |
+| **DEVMPU** | bl2_ext 在 protpgd 分配时编程 APC | Layer 3 注入 devmpu_reset 清除所有 APC | N/A |
+| **需要 `--patch-protpgd`** | ✅ 必须 | ❌ 不需要 (互斥) | ❌ 不需要 |
+| **侵入性** | 最低 | 高 | 中 |
+| **验证状态** | ⚠️ 未实测, 需验证 | ✅ 已验证可用 | ✅ 已验证可用 |
+| **涉及镜像** | tee.img + lk.img | tee.img | lk.img + vendor_boot.img |
+| **工具** | `patch_tee_vcp.py --patch-bank-table` + `detect_lk_gz.py --patch-protpgd` | `patch_tee_vcp.py` | `detect_lk_gz.py --patch-vcp` + `patch_vendor_boot.py` |
+
+**技术背景**：ATF 的 SMMU 代码有两条独立的页表初始化路径，由 bank 配置表中的 `mem_type` 字段决定：
+- **PROTECT (mem_type=0)**：通过 `init_protect_pt_mem` 查询 bl2_ext 分配的 `platform_mtksmmu_protpgd` mblock
+- **SECURE (mem_type=1)**：通过 `init_secure_pt_mem` 查询 GZ (EL2) 在初始化时填充的 256 字节描述符表
+
+出厂配置中 domain 0-1 用 PROTECT 路径，domain 2-7 (含 VCP) 用 SECURE 路径。禁用 GZ 后 SECURE 路径的描述符表全零，导致 `share_iova` SMC 失败 → VCP DMA 翻译到 PA=0x0 → IOMMU fault → WDT 崩溃循环。`--patch-protpgd` 只能救活 domain 0-1（PROTECT 路径），VCP 不受影响。
+
+#### 推荐方案：ATF 三层补丁 (`patch_tee_vcp.py`，默认)
 
 三层补丁 ATF，跳过 SMMU 保护设置并重置 DEVMPU。
 
@@ -583,18 +604,32 @@ Layer 1 单独即可阻止 SMMU 被空页表配置，Layer 2 进一步确保 VCP
 
 ## patch_tee_vcp.py
 
-三层补丁 MTK ATF (tee.img)，跳过 SMMU 保护设置并重置 DEVMPU。适用于 GPT 方案禁用 GZ 后 VCP 因空 SMMU 保护页表崩溃以及 DEVMPU 域7违规的平台（如 MT6895）。
+修补 MTK ATF (tee.img) 以修复 GZ 禁用后的 VCP 问题。提供两种方案：
 
-### 检测流程
+- **方案 A** (`--patch-bank-table`): 改 bank 表 mem_type，最小侵入性，需配合 `--patch-protpgd`
+- **方案 B** (默认): 三层补丁，绕过 SMMU + 跳过 VCP 保护 + 重置 DEVMPU
 
-1. **字符串定位** — 搜索 `vcp_smc_vcp_init` 字符串作为近距离参考
-2. **锚点匹配** — 在函数代码范围内查找 `MOVZ Wn, #0x38` + `STR Wn, [Xm, #0xC]`（VCP MMIO 寄存器写入），提取保护寄存器基址寄存器号
-3. **调用点定位** — 从锚点向前搜索 `MOVZ W3, #1; MOV W2, WZR; BL` 原始模式或 `NOP; NOP; NOP; NOP; B` 已补丁模式
-4. **跳过路径定位** — 搜索 `STR WZR, [Xm, #0]; STUR XZR, [Xm, #4]` 零化+返回成功路径
-5. **保护函数编程 BL 定位** — 从 VCP handler 的 BL 目标地址进入保护函数，找到第 2 个 BL（SMMU 硬件编程调用）
-6. **DEVMPU init 定位** — 搜索 `MOVZ W8, #0x1118; MOVZ W10, #0x5118`（DEVMPU ch0/ch1 enable 寄存器地址），定位 `STR W9, [X8]`（enable ch0 写入），搜索 code cave（60+ 零字节区域）放置 trampoline
+适用于 GPT 方案禁用 GZ 后 VCP 因空 SMMU 保护页表崩溃以及 DEVMPU 域7违规的平台（如 MT6895）。
 
 ### 用法
+
+#### 方案 A: Bank 表补丁 (`--patch-bank-table`)
+
+```bash
+# 步骤 1: LK 补丁（分配 protpgd mblock）
+python3 detect_lk_gz.py lk.img --patch-protpgd
+
+# 步骤 2: ATF bank 表补丁
+python3 patch_tee_vcp.py tee.img --patch-bank-table
+
+# 分析（不修改）
+python3 patch_tee_vcp.py tee.img --patch-bank-table --dry-run
+
+# 还原
+python3 patch_tee_vcp.py tee.img --patch-bank-table --restore
+```
+
+#### 方案 B: 三层补丁（默认）
 
 ```bash
 # 分析（不修改）
@@ -610,7 +645,39 @@ python3 patch_tee_vcp.py tee.img
 python3 patch_tee_vcp.py tee_patched.img --dry-run
 ```
 
-### 补丁内容
+### 方案 A 补丁内容
+
+6 字节数据修改（不改变文件大小）：
+
+| Bank | File offset | 原始 | 补丁后 | 说明 |
+|------|-------------|------|--------|------|
+| 2 | 0x0428C4 | `01` (SECURE) | `00` (PROTECT) | |
+| 3 | 0x0428EC | `01` (SECURE) | `00` (PROTECT) | |
+| 4 | 0x042914 | `01` (SECURE) | `00` (PROTECT) | |
+| 5 | 0x04293C | `01` (SECURE) | `00` (PROTECT) | |
+| 6 | 0x042964 | `01` (SECURE) | `00` (PROTECT) | |
+| 7 | 0x04298C | `01` (SECURE) | `00` (PROTECT) | VCP domain |
+
+效果：所有 domain (0-7) 使用 PROTECT 路径，ATF 通过 `init_protect_pt_mem` 查询 bl2_ext 分配的 protpgd mblock，`program_smmu` 正常填充页表并编程 IOMMU 硬件。VCP `share_iova` SMC 成功，DMA 正常翻译。
+
+> **注意**：此方案必须配合 `detect_lk_gz.py --patch-protpgd` 使用（确保 bl2_ext 分配 protpgd mblock）。不需要 DEVMPU reset（bl2_ext 在 protpgd 分配时会编程 DEVMPU APC）。
+
+### 方案 A 检测流程
+
+1. 从文件偏移 0x200 开始，以 4 字节对齐扫描，查找 `bank_id` 从 0 开始、按步长 0x28 连续递增到 7 的 8 个条目
+2. 验证每个条目的 `mem_type` 为 0 或 1、`sub_idx` ≤ 3
+3. 确认第一个条目的 `mem_type=0`（bank 0 固定为 PROTECT）
+
+### 方案 B 检测流程
+
+1. **字符串定位** — 搜索 `vcp_smc_vcp_init` 字符串作为近距离参考
+2. **锚点匹配** — 在函数代码范围内查找 `MOVZ Wn, #0x38` + `STR Wn, [Xm, #0xC]`（VCP MMIO 寄存器写入），提取保护寄存器基址寄存器号
+3. **调用点定位** — 从锚点向前搜索 `MOVZ W3, #1; MOV W2, WZR; BL` 原始模式或 `NOP; NOP; NOP; NOP; B` 已补丁模式
+4. **跳过路径定位** — 搜索 `STR WZR, [Xm, #0]; STUR XZR, [Xm, #4]` 零化+返回成功路径
+5. **保护函数编程 BL 定位** — 从 VCP handler 的 BL 目标地址进入保护函数，找到第 2 个 BL（SMMU 硬件编程调用）
+6. **DEVMPU init 定位** — 搜索 `MOVZ W8, #0x1118; MOVZ W10, #0x5118`（DEVMPU ch0/ch1 enable 寄存器地址），定位 `STR W9, [X8]`（enable ch0 写入），搜索 code cave（60+ 零字节区域）放置 trampoline
+
+### 方案 B 补丁内容
 
 22 条指令（88 字节），不改变文件大小：
 
@@ -658,7 +725,14 @@ Trampoline（写入 code cave 的零字节区域）：
 
 ### 注意事项
 
-- 此补丁与 `--patch-protpgd` 互斥，不要同时使用
+**方案 A (`--patch-bank-table`)：**
+- 必须配合 `detect_lk_gz.py --patch-protpgd` 使用，二者缺一不可
+- ⚠️ 实验性方案，尚未实测验证
+- 支持 `--restore` 还原（数据补丁可逆）
+- 偏移为 MT6895 实测值，脚本使用模式匹配自动定位
+
+**方案 B（三层补丁，默认）：**
+- 与 `--patch-protpgd` 互斥，不要同时使用
 - 补丁后 VCP 仅使用内核 M4U IOMMU，不再有 SMMU 保护层（GZ 禁用时可接受）
 - Layer 3 重置 DEVMPU 硬件，清除 preloader 设置的所有 APC 限制，域7（VCP/APU）可访问所有 region
 - Trampoline 指令序列来自 ATF 原始 `devmpu_reset` 函数，经过交叉验证

@@ -1,39 +1,31 @@
 #!/usr/bin/env python3
 """
-patch_tee_vcp.py - Patch MTK ATF (tee.img) to disable SMMU/DEVMPU for GZ bypass
+patch_tee_vcp.py - Patch MTK ATF (tee.img) to fix VCP after GZ bypass
 
-When GenieZone (GZ) is disabled, two hardware protection systems cause boot
-failures that must be patched in ATF:
+When GenieZone (GZ) is disabled, ATF's SMMU/DEVMPU protection systems cause
+VCP boot failures. This tool provides two approaches:
 
-A) SMMU: The protection page table (protpgd) has no valid entries -- GZ normally
-   fills them at boot. Without valid entries, DMA through SMMU maps to PA=0x0,
-   causing IOMMU translation faults / WDT resets.
+方案 A: --patch-bank-table (推荐, 需配合 --patch-protpgd)
+  ATF 的 SMMU bank 表中, domain 2-7 的 mem_type=1 (SECURE 路径),
+  该路径依赖 GZ 在 EL2 初始化时填充的描述符表, 禁用 GZ 后表为空.
+  补丁将 mem_type 改为 0 (PROTECT 路径), 使所有 domain 走 protpgd mblock,
+  由 bl2_ext (--patch-protpgd) 分配. ATF 运行时正常填充页表项和编程 HW.
+  VCP 保留完整 SMMU 保护, 最小侵入性.
 
-B) DEVMPU: Domain 7 (VCP/APU) loses access to PROT_SHARED memory region
-   (region 10) because GZ normally proxied VCP memory requests. Without GZ,
-   the DEVMPU (Device Memory Protection Unit) at 0x10351000/0x10355000
-   enforces access restrictions set by the preloader, causing a 12K+ violation
-   IRQ storm and HWT kernel crash ~33 seconds after boot.
+  用法:
+    python3 detect_lk_gz.py lk.img --patch-protpgd       # 步骤 1: LK
+    python3 patch_tee_vcp.py tee.img --patch-bank-table   # 步骤 2: ATF
 
-Three-layer patch:
-  1. Global SMMU bypass: NOP the SMMU programming BL inside the protection
-     function so ALL callers skip SMMU hardware configuration.
-  2. VCP handler skip: patch vcp_smc_vcp_init to skip the protection call
-     and jump to the existing "zero+succeed" path.
-  3. DEVMPU reset: inject a devmpu_reset call (write 7 then 1 to control
-     registers 0x10351104/0x10355104) into the DEVMPU init function via a
-     trampoline in a code cave. This clears ALL DEVMPU APC (access permission
-     control) values set by the preloader, including domain 7's restriction
-     on PROT_SHARED (region 10). After reset, only region boundaries are
-     reprogrammed (no APC restrictions), so VCP/APU get unrestricted access.
+方案 B: 默认三层补丁 (核弹级, 不需要 --patch-protpgd)
+  1. Global SMMU bypass: NOP SMMU programming BL
+  2. VCP handler skip: 跳过 protection 调用
+  3. DEVMPU reset: 注入 devmpu_reset 清除所有 APC 限制
+  完全绕过安全 SMMU, VCP 仅用内核 M4U IOMMU, 无 SMMU 保护.
 
-Usage:
+  用法:
     python3 patch_tee_vcp.py tee.img -o tee_patched.img
-    python3 patch_tee_vcp.py tee.img --dry-run     # analysis only
-    python3 patch_tee_vcp.py tee.img --restore      # revert patch
-
-Note: do NOT use --patch-protpgd in detect_lk_gz.py together with this patch.
-      The protpgd mblock allocation is no longer needed when SMMU is bypassed.
+    python3 patch_tee_vcp.py tee.img --dry-run
+    python3 patch_tee_vcp.py tee.img --restore
 """
 
 import struct
@@ -44,6 +36,9 @@ import shutil
 
 MTK_IMG_HDR_SIZE = 0x200
 NOP = 0xD503201F
+
+BANK_TABLE_STRIDE = 0x28    # 40 bytes per bank entry
+BANK_TABLE_COUNT = 8
 
 DEVMPU_INIT_SIG_0 = 0x52822308   # MOVZ W8, #0x1118 (DEVMPU ch0 enable register low)
 DEVMPU_INIT_SIG_1 = 0x528A230A   # MOVZ W10, #0x5118 (DEVMPU ch1 enable register low)
@@ -332,6 +327,79 @@ def find_devmpu_reset_patch(data):
     return (init_str_foff, cave_foff)
 
 
+def find_bank_table(data):
+    """Find the SMMU bank configuration table in ATF.
+
+    Table layout: 8 entries at stride 0x28 (40 bytes each).
+    Entry format:
+      [+0x00] bank_id  (u32, 0-7 sequential)
+      [+0x04] mem_type (u32, 0=PROTECT via protpgd mblock, 1=SECURE via GZ table)
+      [+0x08] sub_idx  (u32, selects sub-buffer within protpgd)
+      [+0x0C] pad      (u32)
+      [+0x10] size     (u64, IOMMU bank region size)
+      [+0x18] base     (u64, IOMMU bank base address)
+      [+0x20] pad      (u64)
+
+    Returns list of 8 entry dicts, or None if not found.
+    """
+    code_base = MTK_IMG_HDR_SIZE
+    stride = BANK_TABLE_STRIDE
+
+    for off in range(code_base, len(data) - stride * BANK_TABLE_COUNT, 4):
+        if read_u32(data, off) != 0:
+            continue
+        ok = True
+        for i in range(BANK_TABLE_COUNT):
+            e = off + i * stride
+            if e + stride > len(data):
+                ok = False
+                break
+            bid = read_u32(data, e)
+            mt = read_u32(data, e + 4)
+            si = read_u32(data, e + 8)
+            if bid != i or mt > 1 or si > 3:
+                ok = False
+                break
+        if not ok:
+            continue
+        if read_u32(data, off + 4) != 0:
+            continue
+
+        entries = []
+        for i in range(BANK_TABLE_COUNT):
+            e = off + i * stride
+            entries.append({
+                'offset': e,
+                'bank_id': read_u32(data, e),
+                'mem_type': read_u32(data, e + 4),
+                'mem_type_off': e + 4,
+                'sub_idx': read_u32(data, e + 8),
+                'size': struct.unpack_from('<Q', data, e + 0x10)[0],
+                'base': struct.unpack_from('<Q', data, e + 0x18)[0],
+            })
+        return entries
+
+    return None
+
+
+def build_bank_table_patches(data, entries):
+    """Build patches to change SECURE banks (mem_type=1) to PROTECT (mem_type=0).
+
+    Returns list of (file_offset, original_bytes, patched_bytes, description).
+    """
+    patches = []
+    for ent in entries:
+        if ent['mem_type'] == 1:
+            off = ent['mem_type_off']
+            patches.append((
+                off,
+                struct.pack('<I', 1),
+                struct.pack('<I', 0),
+                "bank %d: mem_type SECURE(1)->PROTECT(0)" % ent['bank_id'],
+            ))
+    return patches
+
+
 def build_patches(data, site, devmpu_info=None):
     """
     Build patch entries: list of (file_offset, original_4bytes, patched_4bytes, desc).
@@ -452,25 +520,25 @@ def restore_patches(data, patches):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Patch MTK ATF (tee.img) to skip VCP SMMU protection and reset DEVMPU",
+        description="Patch MTK ATF (tee.img) to fix VCP after GZ bypass",
         epilog="""
-This patch allows VCP/APU to function when GenieZone is disabled.
-Without GZ, the SMMU protection page table has no valid entries,
-causing VCP DMA translation faults. The patch skips the protection
-setup so VCP uses only the kernel's IOMMU (which is properly configured).
-Additionally, the DEVMPU is reset during ATF init to clear preloader
-APC restrictions that block domain 7 (VCP/APU) from PROT_SHARED memory.
+方案 A (推荐): --patch-bank-table
+  将 SMMU bank 表中 SECURE(1) 改为 PROTECT(0), 配合 --patch-protpgd 使用.
+  VCP 保留 SMMU 保护, ATF 正常填充页表项.
 
-IMPORTANT: Do NOT use --patch-protpgd when this ATF patch is applied.
-           The protpgd mblock allocation is no longer needed.
+方案 B (默认, 无额外参数):
+  三层补丁: 绕过 SMMU + 跳过 VCP 保护 + 重置 DEVMPU.
+  完全绕过安全 SMMU, 不需要 --patch-protpgd.
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('input', help='Input tee.img file')
-    parser.add_argument('-o', '--output', help='Output patched file (default: overwrite input)')
+    parser.add_argument('-o', '--output', help='Output patched file (default: *_patched.*)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Analyze only, do not write')
     parser.add_argument('--restore', action='store_true',
                         help='Restore original bytes (revert patch)')
+    parser.add_argument('--patch-bank-table', action='store_true',
+                        help='(方案A) 改 bank 表 mem_type, 需配合 --patch-protpgd')
 
     args = parser.parse_args()
 
@@ -488,6 +556,133 @@ IMPORTANT: Do NOT use --patch-protpgd when this ATF patch is applied.
     magic = data[0:4]
     if magic != b'\x88\x16\x88\x58':
         print("[!] Warning: unexpected MTK header magic: %s" % magic.hex())
+
+    base, ext = os.path.splitext(args.input)
+    output_path = args.output or (base + '_patched' + ext)
+
+    if args.patch_bank_table:
+        return main_bank_table(data, args, output_path)
+    else:
+        return main_three_layer(data, args, output_path)
+
+
+def main_bank_table(data, args, output_path):
+    """方案 A: bank 表 mem_type 补丁."""
+    print("[*] 方案 A: SMMU bank 表补丁")
+    print("[*] Searching for SMMU bank table...")
+
+    entries = find_bank_table(data)
+    if entries is None:
+        print("[!] SMMU bank table not found in tee.img")
+        return 1
+
+    print("  [+] Bank table found at file 0x%06X (stride=0x%X, %d entries)" %
+          (entries[0]['offset'], BANK_TABLE_STRIDE, len(entries)))
+    print()
+    print("  %-6s  %-12s  %-8s  %-8s  %-12s" %
+          ("Bank", "File offset", "mem_type", "sub_idx", "size"))
+    print("  " + "-" * 56)
+    secure_count = 0
+    for ent in entries:
+        path = "PROTECT" if ent['mem_type'] == 0 else "SECURE"
+        marker = ""
+        if ent['mem_type'] == 1:
+            marker = "  <-- 需修改"
+            secure_count += 1
+        print("  %-6d  0x%06X      %d (%s)  %d        0x%08X%s" %
+              (ent['bank_id'], ent['mem_type_off'], ent['mem_type'],
+               path.ljust(7), ent['sub_idx'], ent['size'], marker))
+
+    if secure_count == 0:
+        print()
+        if args.restore:
+            print("[!] All banks already use PROTECT path, nothing to restore.")
+        else:
+            print("[*] All banks already use PROTECT path. Bank table patch already applied.")
+        return 0
+
+    patches = build_bank_table_patches(data, entries)
+    state = verify_state(data, patches)
+
+    if args.restore:
+        if state != 'patched':
+            print()
+            print("[!] Bank table is in original state, nothing to restore.")
+            return 0
+        print()
+        print("[*] Restoring bank table to original state...")
+        if args.dry_run:
+            print("[*] Dry run -- not writing.")
+            return 0
+        result = restore_patches(data, patches)
+        out_path = args.output or args.input
+        if out_path == args.input:
+            shutil.copy2(args.input, args.input + '.bak')
+            print("[*] Backup: %s.bak" % args.input)
+        with open(out_path, 'wb') as f:
+            f.write(result)
+        print("[+] Restored to: %s" % out_path)
+        return 0
+
+    print()
+    print("  补丁内容: %d 个 bank 的 mem_type 从 SECURE(1) 改为 PROTECT(0)" %
+          secure_count)
+    print("  %-12s  %-10s  %-10s  %s" %
+          ("File offset", "Original", "Patched", "Description"))
+    print("  " + "-" * 64)
+    for foff, orig, patch, desc in patches:
+        actual = data[foff:foff + len(orig)]
+        marker = ""
+        if actual == patch:
+            marker = " [already patched]"
+        elif actual != orig:
+            marker = " [MISMATCH]"
+        print("  0x%06X      %s      %s      %s%s" %
+              (foff, orig.hex(), patch.hex(), desc, marker))
+
+    print()
+    print("  效果:")
+    print("    所有 domain (0-7) 使用 PROTECT 路径 (protpgd mblock)")
+    print("    ATF init_protect_pt_mem 查到 bl2_ext 分配的 protpgd → 成功")
+    print("    ATF program_smmu 正常写入 section 描述符 + 编程 IOMMU 硬件")
+    print("    VCP share_iova SMC 成功 → DMA 正常翻译 → 不 fault")
+    print()
+    print("  前提: 必须同时对 lk.img 应用 --patch-protpgd")
+    print("    python3 detect_lk_gz.py lk.img --patch-protpgd")
+
+    if args.dry_run:
+        print()
+        print("[*] Dry run -- not writing.")
+        return 0
+
+    result = apply_patches(data, patches)
+
+    if not os.path.isfile(output_path.replace('_patched', '_backup')):
+        backup_path = base_path_backup(args.input)
+        if backup_path and not os.path.isfile(backup_path):
+            shutil.copy2(args.input, backup_path)
+            print("[*] Backup: %s" % backup_path)
+
+    with open(output_path, 'wb') as f:
+        f.write(result)
+
+    print()
+    print("[+] 完成! 已修改 %d 个 bank 的 mem_type" % secure_count)
+    print("    输出: %s" % output_path)
+    print()
+    print("[!] 下一步: 对 lk.img 应用 --patch-protpgd:")
+    print("    python3 detect_lk_gz.py lk.img --patch-protpgd")
+    return 0
+
+
+def base_path_backup(path):
+    base, ext = os.path.splitext(path)
+    return base + '_backup' + ext
+
+
+def main_three_layer(data, args, output_path):
+    """方案 B: 三层补丁 (SMMU bypass + VCP skip + DEVMPU reset)."""
+    print("[*] 方案 B: 三层补丁 (SMMU bypass)")
 
     print("[*] Searching for VCP SMMU protection call site...")
     try:
@@ -557,7 +752,8 @@ IMPORTANT: Do NOT use --patch-protpgd when this ATF patch is applied.
             if out_path == args.input:
                 shutil.copy2(args.input, args.input + '.bak')
                 print("[*] Backup: %s.bak" % args.input)
-            open(out_path, 'wb').write(result)
+            with open(out_path, 'wb') as f:
+                f.write(result)
             print("[+] Restored to: %s" % out_path)
             return 0
         print("[*] Patch is already applied. Nothing to do.")
@@ -602,12 +798,12 @@ IMPORTANT: Do NOT use --patch-protpgd when this ATF patch is applied.
     print()
     print("[*] Applying patch...")
     result = apply_patches(data, patches)
-    out_path = args.output or args.input
-    if out_path == args.input:
+    if output_path == args.input:
         shutil.copy2(args.input, args.input + '.bak')
         print("[*] Backup: %s.bak" % args.input)
-    open(out_path, 'wb').write(result)
-    print("[+] Patched tee.img written to: %s" % out_path)
+    with open(output_path, 'wb') as f:
+        f.write(result)
+    print("[+] Patched tee.img written to: %s" % output_path)
     print()
     print("[!] IMPORTANT:")
     print("    - This patch is specific to this firmware's ATF binary")
