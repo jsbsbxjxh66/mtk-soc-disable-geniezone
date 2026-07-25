@@ -481,7 +481,7 @@ GZ 被跳过
 
 #### ATF VCP 方案对比
 
-| | 方案 A: `--patch-bank-table` (实验性) | 方案 B: 三层补丁 (默认, 已验证) | 方案 C: VCP 禁用 |
+| | 方案 A: `--patch-bank-table` (实验性) | 方案 B: 三层补丁 (实验性) | 方案 C: VCP 禁用 |
 |---|---|---|---|
 | **原理** | 改 ATF bank 表 mem_type, 让所有 domain 走 PROTECT 路径 | 绕过安全 SMMU + 跳过 VCP 保护 + 重置 DEVMPU | 关闭 VCP 驱动 probe |
 | **改动量** | 6 字节 (数据表) | 22 条指令 + 蹦床代码 | DTB 属性修改 (两个镜像) |
@@ -490,7 +490,7 @@ GZ 被跳过
 | **DEVMPU** | bl2_ext 在 protpgd 分配时编程 APC | Layer 3 注入 devmpu_reset 清除所有 APC | N/A |
 | **需要 `--patch-protpgd`** | ✅ 必须 | ❌ 不需要 (互斥) | ❌ 不需要 |
 | **侵入性** | 最低 | 高 | 中 |
-| **验证状态** | ⚠️ 未实测, 需验证 | ✅ 已验证可用 | ✅ 已验证可用 |
+| **验证状态** | ⚠️ 未实测, 需验证 | ⚠️ 未实测, 需验证 | ⚠️ 未实测, 需验证 |
 | **涉及镜像** | tee.img + lk.img | tee.img | lk.img + vendor_boot.img |
 | **工具** | `patch_tee_vcp.py --patch-bank-table` + `detect_lk_gz.py --patch-protpgd` | `patch_tee_vcp.py` | `detect_lk_gz.py --patch-vcp` + `patch_vendor_boot.py` |
 
