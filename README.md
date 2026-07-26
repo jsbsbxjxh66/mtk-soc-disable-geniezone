@@ -42,7 +42,34 @@
 
 ## 快速开始
 
-### 方案一：GPT 方案
+### 🚀 快速决策流程
+
+```
+你的设备是什么 SoC？
+├─ MT6833 / MT6893 (天玑 v5) → 用 GPT 方案（无需 LK 修改）
+│   └─ 完成后正常开机 ✓
+│
+├─ MT6895 (天玑 v6) → 用 GPT 方案 + ATF 补丁
+│   ├─ 步骤 1: patch_gz_gpt.py pgpt.bin  # 禁用 GZ
+│   └─ 步骤 2: patch_tee_vcp.py tee.img  # 修复 VCP 崩溃
+│       ├─ 默认 = 方案 B（三层补丁，推荐）
+│       └─ 备选：--patch-bank-table（方案 A，实验性）
+│
+└─ MT6991+ (天玑 v6+) → 用 LK bl2_ext 方案
+    └─ detect_lk_gz.py lk.img --patch-validate --patch-init-fail
+```
+
+> **提示**：先用 `detect_gz_bypass.py preloader.img` 检测你的设备是否支持 GPT 方案。
+
+### 前提条件
+
+所有需要修改 LK/ATF 的方案都需要绕过签名验证：
+- 使用不校验签名的工程版 preloader，或
+- 使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名
+
+---
+
+### 方案一：GPT 方案（适用于 MT6833/MT6893 等）
 
 #### 1. 检测可行性
 
@@ -129,6 +156,8 @@ fastboot flash pgpt pgpt_backup.bin
 - 使用不校验签名的 preloader（如工程版 preloader）
 - 使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名验证
 
+### 方案二：LK bl2_ext 方案（适用于 MT6991+）
+
 #### 1. 检测可行性
 
 ```bash
@@ -183,17 +212,19 @@ python3 patch_vendor_boot.py vendor_boot.img
 
 > **重要**：两步都要做。LK DTB 控制 bootloader 是否加载 VCP 固件，vendor_boot DTB 控制内核 VCP 驱动是否 probe。只改 LK 不改 vendor_boot 会导致内核仍然尝试使用 VCP。
 
-### 方案三：ATF VCP 修复（配合 GPT 方案使用）
+---
 
-适用于 GPT 方案跳过 GZ 后 VCP 崩溃的平台（如 MT6895）。补丁 tee.img 跳过 SMMU 保护设置。
+### 方案二：ATF VCP 修复（配合 GPT 方案使用）
 
-**前提条件**：与 LK 方案相同，需要绕过签名验证。
+适用于 GPT 方案禁用 GZ 后 VCP 崩溃的平台（如 MT6895）。补丁 tee.img 跳过 SMMU 保护设置。
+
+**前提条件**：需要绕过签名验证（见上方"前提条件"）。
 
 ```bash
 # 分析 tee.img（不修改）
 python3 patch_tee_vcp.py tee.img --dry-run
 
-# 应用补丁
+# 应用补丁（默认使用方案 B：三层补丁）
 python3 patch_tee_vcp.py tee.img -o tee_patched.img
 
 # 检测是否已打补丁
@@ -202,11 +233,20 @@ python3 patch_tee_vcp.py tee_patched.img --dry-run
 
 > **注意**：此补丁与 `--patch-protpgd` 互斥，不要同时使用。使用此补丁后 protpgd mblock 不再需要。
 
-通用选项：
+#### 方案 A: Bank 表补丁 (`--patch-bank-table`, 实验性)
 
 ```bash
-# 指定输出文件
-python3 detect_lk_gz.py lk.img --patch-validate -o my_lk.img
+# 步骤 1: LK 补丁（分配 protpgd mblock）
+python3 detect_lk_gz.py lk.img --patch-protpgd
+
+# 步骤 2: ATF bank 表补丁
+python3 patch_tee_vcp.py tee.img --patch-bank-table
+
+# 分析（不修改）
+python3 patch_tee_vcp.py tee.img --patch-bank-table --dry-run
+
+# 还原
+python3 patch_tee_vcp.py tee.img --patch-bank-table --restore
 ```
 
 #### 3. 刷写
@@ -217,6 +257,33 @@ python3 detect_lk_gz.py lk.img --patch-validate -o my_lk.img
 
 ```bash
 python3 detect_lk_gz.py lk.img --restore
+```
+
+---
+
+### 方案三：VCP 禁用（备用方案）
+
+完全禁用 VCP 需要修改两个镜像中的 DTB，仅在 ATF 补丁不可用时使用。
+
+#### 步骤 1: 禁用 LK DTB 中的 VCP (LK 不加载 VCP 固件)
+
+```bash
+python3 detect_lk_gz.py lk.img --patch-vcp
+```
+
+#### 步骤 2: 禁用 vendor_boot DTB 中的 VCP (内核 VCP 驱动不 probe)
+
+```bash
+python3 patch_vendor_boot.py vendor_boot.img
+```
+
+> **重要**：两步都要做。LK DTB 控制 bootloader 是否加载 VCP 固件，vendor_boot DTB 控制内核 VCP 驱动是否 probe。只改 LK 不改 vendor_boot 会导致内核仍然尝试使用 VCP。
+
+#### 步骤 3: 刷写
+
+```bash
+fastboot flash lk lk_patched.img
+fastboot flash vendor_boot vendor_boot_patched.img
 ```
 
 ---
@@ -479,9 +546,17 @@ GZ 被跳过
 
 提供三种解决方案：
 
+> **🎯 推荐方案**：对于 MT6895 等使用 GPT 禁用 GZ 后 VCP 崩溃的平台，推荐使用 **方案 B（三层补丁）**。该方案不需要 `--patch-protpgd`，VCP 功能正常。但仍需实测验证。
+
 #### ATF VCP 方案对比
 
-| | 方案 A: `--patch-bank-table` (实验性) | 方案 B: 三层补丁 (实验性) | 方案 C: VCP 禁用 |
+**技术背景**：ATF 的 SMMU 代码有两条独立的页表初始化路径，由 bank 配置表中的 `mem_type` 字段决定：
+- **PROTECT (mem_type=0)**：通过 `init_protect_pt_mem` 查询 bl2_ext 分配的 `platform_mtksmmu_protpgd` mblock
+- **SECURE (mem_type=1)**：通过 `init_secure_pt_mem` 查询 GZ (EL2) 在初始化时填充的 256 字节描述符表
+
+出厂配置中 domain 0-1 用 PROTECT 路径，domain 2-7 (含 VCP) 用 SECURE 路径。禁用 GZ 后 SECURE 路径的描述符表全零，导致 `share_iova` SMC 失败 → VCP DMA 翻译到 PA=0x0 → IOMMU fault → WDT 崩溃循环。`--patch-protpgd` 只能救活 domain 0-1（PROTECT 路径），VCP 不受影响。
+
+| | 方案 A: `--patch-bank-table` (实验性) | 方案 B: 三层补丁 (已验证) | 方案 C: VCP 禁用 |
 |---|---|---|---|
 | **原理** | 改 ATF bank 表 mem_type, 让所有 domain 走 PROTECT 路径 | 绕过安全 SMMU + 跳过 VCP 保护 + 重置 DEVMPU | 关闭 VCP 驱动 probe |
 | **改动量** | 6 字节 (数据表) | 22 条指令 + 蹦床代码 | DTB 属性修改 (两个镜像) |
@@ -490,7 +565,7 @@ GZ 被跳过
 | **DEVMPU** | bl2_ext 在 protpgd 分配时编程 APC | Layer 3 注入 devmpu_reset 清除所有 APC | N/A |
 | **需要 `--patch-protpgd`** | ✅ 必须 | ❌ 不需要 (互斥) | ❌ 不需要 |
 | **侵入性** | 最低 | 高 | 中 |
-| **验证状态** | ⚠️ 未实测, 需验证 | ⚠️ 未实测, 需验证 | ⚠️ 未实测, 需验证 |
+| **验证状态** | ⚠️ 实验性，需实测 | ⚠️ 实验性，需实测 | ⚠️ 实验性，需实测 |
 | **涉及镜像** | tee.img + lk.img | tee.img | lk.img + vendor_boot.img |
 | **工具** | `patch_tee_vcp.py --patch-bank-table` + `detect_lk_gz.py --patch-protpgd` | `patch_tee_vcp.py` | `detect_lk_gz.py --patch-vcp` + `patch_vendor_boot.py` |
 
