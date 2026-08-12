@@ -11,7 +11,7 @@
 | 工具 | 用途 |
 |------|------|
 | `detect_gz_bypass.py` | 分析 preloader 固件，检测 GPT 修改方案是否可用，推荐无效 LBA 或重名子方案 |
-| `patch_gz_gpt.py` | 修改 GPT 分区表（PGPT）：重名 gz→gx（`--rename`）或将 LBA 指向无效地址（默认） |
+| `patch_gz_gpt.py` | 修改 GPT 分区表（PGPT）：方案 B 重名 gz→gx（`--rename`）或方案 A 无效 LBA（默认） |
 | `detect_lk_gz.py` | 分析 LK 固件，检测并修补 bl2_ext GZ 初始化管线，支持 DTB VCP 节点禁用 |
 | `patch_tee_vcp.py` | 补丁 ATF (tee.img)，支持两种方案：bank 表补丁 (`--patch-bank-table`, 实验性) 或三层补丁（默认, 已验证），解决禁用 GZ 后 VCP 崩溃和 DEVMPU 违规问题 |
 | `patch_vendor_boot.py` | 修补 vendor_boot.img 中的内核设备树，禁用 VCP 驱动 probe（配合 `--patch-vcp` 使用） |
@@ -20,16 +20,16 @@
 
 | 方案 | 层面 | 条件 | 是否需要跳过签名 |
 |------|------|------|-----------------|
-| **GPT 重名方案** | Preloader | `halt_on_assert` 未强制置 1 且主引导循环无 gz 硬依赖 | 否 |
-| **GPT 无效 LBA 方案** | Preloader | `halt_on_assert` 未被强制置 1 | 否 |
+| **GPT 方案 A（无效 LBA）** | Preloader | `halt_on_assert` 未被强制置 1 | 否 |
+| **GPT 方案 B（重名）** | Preloader | `halt_on_assert` 未强制置 1 且主引导循环无 gz 硬依赖 | 否 |
 | **擦除 gz 分区** | gz 分区 | v6+ 处理器（MT6985/MT6989/MT6991） | 否 |
 | **LK bl2_ext 方案** | LK (bl2_ext 段) | bl2_ext 中存在 GZ 初始化管线 | 是 |
 | **ATF VCP 修复** | ATF (tee.img) | ATF 中存在 vcp_smc_vcp_init 函数和 DEVMPU 初始化函数 | 是 |
 | **VCP 禁用** | LK (DTB) + vendor_boot (DTB) | DTB 中存在 vcp-support 节点 | 是 |
 
 - GPT 方案有两个子方案，均不修改代码：
-  - **重名方案** (`--rename`)：将 gz 分区改名为 gx，`get_part_info("gz")` 找不到分区 → 无 I/O → 设置 NoGZ。需 preloader 主引导循环不独立依赖 gz 分区名解析（`detect_gz_bypass.py` 自动检测）
-  - **无效 LBA 方案**（默认）：将 gz 分区 LBA 改为越界地址，存储 I/O 失败 → 设置 NoGZ
+  - **方案 A（无效 LBA，推荐）**：将 gz 分区 LBA 改为越界地址，存储 I/O 失败 → 设置 NoGZ
+  - **方案 B（重名，`--rename`）**：将 gz 分区改名为 gx，`get_part_info("gz")` 找不到分区 → 无 I/O → 设置 NoGZ。需 preloader 主引导循环不独立依赖 gz 分区名解析（`detect_gz_bypass.py` 自动检测）
 - LK bl2_ext 方案（MT6991 等）— GZ 逻辑在 bl2_ext 段，使用 Hafnium S-EL2 + GenieZone 架构：
   - **方案 A** (`--patch-validate`)：补丁 `gz_config_validate` 返回 0，跳过 GZ 初始化
   - **方案 B** (`--patch-init-fail`)：强制 `gz_init_main` 跳转到错误清理路径，触发 `gz_mblock_free_all` 释放内存
@@ -88,9 +88,9 @@ python3 detect_gz_bypass.py preloader.img
 输出示例（GPT 可用，重名可行）：
 ```
 ============================================================
-  推荐: 无效 LBA 方案 (只需修改 PGPT)
+  推荐: 方案 A - 无效 LBA (只需修改 PGPT)
   python3 patch_gz_gpt.py <pgpt.bin>
-  备选: 重名方案
+  备选: 方案 B - 重名
   python3 patch_gz_gpt.py --rename <pgpt.bin>
 
   * 以上结果仅供参考, 实际可行性因固件版本和设备而异
@@ -99,9 +99,9 @@ python3 detect_gz_bypass.py preloader.img
 输出示例（GPT 可用，重名不可行）：
 ```
 ============================================================
-  推荐: 无效 LBA 方案 (只需修改 PGPT)
+  推荐: 方案 A - 无效 LBA (只需修改 PGPT)
   python3 patch_gz_gpt.py <pgpt.bin>
-  重名方案: 不可行
+  方案 B - 重名: 不可行
 
   * 以上结果仅供参考, 实际可行性因固件版本和设备而异
 ```
@@ -114,10 +114,10 @@ python3 detect_gz_bypass.py preloader.img
 # 分析分区表（不修改）
 python3 patch_gz_gpt.py pgpt.bin --dry-run
 
-# 无效 LBA 方案（推荐，只需修改 PGPT）
+# 方案 A - 无效 LBA（推荐，只需修改 PGPT）
 python3 patch_gz_gpt.py pgpt.bin
 
-# 重名方案（备选）
+# 方案 B - 重名（备选）
 python3 patch_gz_gpt.py pgpt.bin --rename
 
 # 指定输出文件名
@@ -390,13 +390,13 @@ GPT 可用时，脚本进一步推荐子方案：
 
 | 重名可行性 | 推荐 | 命令 |
 |-----------|------|------|
-| 可行 | 无效 LBA (推荐) + 重名 (备选) | `patch_gz_gpt.py <pgpt.bin>` |
-| 不可行 | 无效 LBA 方案 | `patch_gz_gpt.py <pgpt.bin>` |
-| 未知 | 无效 LBA 方案 | `patch_gz_gpt.py <pgpt.bin>` |
+| 可行 | 方案 A（无效 LBA）+ 方案 B（重名，备选） | `patch_gz_gpt.py <pgpt.bin>` |
+| 不可行 | 方案 A（无效 LBA） | `patch_gz_gpt.py <pgpt.bin>` |
+| 未知 | 方案 A（无效 LBA） | `patch_gz_gpt.py <pgpt.bin>` |
 
-无效 LBA 方案和重名方案均修改 PGPT。部分设备可能需要将修改后的文件同时刷写到 SGPT 以确保一致性。
+方案 A（无效 LBA）和方案 B（重名）均修改 PGPT。部分设备可能需要将修改后的文件同时刷写到 SGPT 以确保一致性。
 
-**重名方案判定**：preloader 的 `gz_init` 加载 gz 分区时，找不到分区名会正常设置 NoGZ。但部分平台（如 MT6833）的主引导循环在 gz_init **之外**还独立调用 `name_resolver("gz")`，该调用失败导致整个引导流水线中断（跳过 LK 加载 → 无限循环）。脚本通过代码引用计数 + 主引导函数扫描双重检测来判定。
+**方案 B（重名）判定**：preloader 的 `gz_init` 加载 gz 分区时，找不到分区名会正常设置 NoGZ。但部分平台（如 MT6833）的主引导循环在 gz_init **之外**还独立调用 `name_resolver("gz")`，该调用失败导致整个引导流水线中断（跳过 LK 加载 → 无限循环）。脚本通过代码引用计数 + 主引导函数扫描双重检测来判定。
 
 ### 输出字段说明
 
@@ -409,10 +409,10 @@ GPT 可用时，脚本进一步推荐子方案：
 | `assert_fatal` | assert_fatal 函数的文件偏移 |
 | `halt_on_assert` | halt_on_assert BSS 变量的内存地址 |
 | `写入点` | 无条件 STRB #1 的位置（强制置 1 的证据）|
-| `重名方案` | gz 分区重名可行性：可行 / 不可行 / 未知 |
+| `方案 B（重名）` | gz 分区重名可行性：可行 / 不可行 / 未知 |
 | `主引导函数` | 主引导函数代码范围及是否包含 gz 分区名引用 |
 | `存储类型` | UFS / eMMC |
-| `无效 LBA 欺骗` | UFS 越界风险检测 |
+| `方案 A（无效 LBA）` | UFS 越界风险检测 |
 
 ---
 
@@ -420,8 +420,8 @@ GPT 可用时，脚本进一步推荐子方案：
 
 修改 GPT 分区表中的 gz 分区（PGPT 主分区表），两种子方案：
 
-- **重名方案** (`--rename`)：将 gz 分区名改为 gx，preloader 的 `get_part_info("gz")` 找不到分区 → 无 I/O → 设置 NoGZ
-- **无效 LBA 方案**（默认）：将 gz 分区 LBA 改为越界地址 (`total_lbas`)，存储 I/O 失败 → 设置 NoGZ
+- **方案 B（重名，`--rename`）**：将 gz 分区名改为 gx，preloader 的 `get_part_info("gz")` 找不到分区 → 无 I/O → 设置 NoGZ
+- **方案 A（无效 LBA，默认）**：将 gz 分区 LBA 改为越界地址 (`total_lbas`)，存储 I/O 失败 → 设置 NoGZ
 
 ### 用法
 
@@ -429,10 +429,10 @@ GPT 可用时，脚本进一步推荐子方案：
 # 分析分区表（不修改）
 python3 patch_gz_gpt.py pgpt.bin --dry-run
 
-# 无效 LBA 方案（推荐，只需修改 PGPT）
+# 方案 A - 无效 LBA（推荐，只需修改 PGPT）
 python3 patch_gz_gpt.py pgpt.bin
 
-# 重名方案（备选）
+# 方案 B - 重名（备选）
 python3 patch_gz_gpt.py pgpt.bin --rename
 
 # 指定输出文件
@@ -988,28 +988,9 @@ BROM → preloader (签名验证) → ATF → LK (bl2_ext) → LK (lk) → kerne
 - **bl2_ext 方案 A**：补丁 gz_config_validate → 返回 0 → 跳过 bl2_ext 中的 GZ 初始化
 - **bl2_ext 方案 B**：补丁 gz_init_main → 强制走失败路径 → gz_mblock_free_all 释放内存
 
-### GPT 子方案 A: 重名方案
+### GPT 子方案 A: 无效 LBA
 
-将 gz 分区名改为 gx（保留 LBA 不变），`get_part_info("gz1")` 找不到分区 → 返回失败 → 设置 NoGZ。
-
-```
-阶段 1: gz_init()
-  read_part("gz")
-    name_resolver("gz") → "gz1" → get_part_info("gz1") → 找不到（已改名为 gx1）
-  read_part 返回 -1 → 设置 NoGZ = 0x4E6F475A  ✓
-
-阶段 2: 主分区加载循环
-  情况 A (MT6893 等): gz 加载完全封装在 gz_init 中，主循环不独立引用 "gz" → 安全 ✓
-  情况 B (MT6833 等): 主循环独立调用 name_resolver("gz") → 找不到 → 致命错误 ✗
-```
-
-**重名方案是否可行取决于 preloader 主引导函数是否独立引用 "gz" 分区名。** `detect_gz_bypass.py` 通过双重检查（代码引用计数 + 主引导函数扫描）自动判定。
-
-### GPT 子方案 B: 无效 LBA 欺骗
-
-核心发现：`get_part_info()` 只做名称匹配，不验证 LBA 地址有效性。而实际的存储 I/O 由 `func_40974` 执行，它在读取失败时返回 -1。
-
-将 gz1 分区的 LBA 改为超出设备容量的值后：
+将 gz 分区 LBA 改为超出设备容量的值，`get_part_info("gz1")` 找到分区但存储 I/O 失败 → 返回失败 → 设置 NoGZ。
 
 ```
 阶段 1: gz_init()
@@ -1026,6 +1007,23 @@ BROM → preloader (签名验证) → ATF → LK (bl2_ext) → LK (lk) → kerne
 ```
 
 无效 LBA 方案不依赖主引导函数的代码结构，兼容性更广，但存储控制器对越界 LBA 的处理因硬件而异。
+
+### GPT 子方案 B: 重名
+
+将 gz 分区名改为 gx（保留 LBA 不变），`get_part_info("gz1")` 找不到分区 → 返回失败 → 设置 NoGZ。
+
+```
+阶段 1: gz_init()
+  read_part("gz")
+    name_resolver("gz") → "gz1" → get_part_info("gz1") → 找不到（已改名为 gx1）
+  read_part 返回 -1 → 设置 NoGZ = 0x4E6F475A  ✓
+
+阶段 2: 主分区加载循环
+  情况 A (MT6893 等): gz 加载完全封装在 gz_init 中，主循环不独立引用 "gz" → 安全 ✓
+  情况 B (MT6833 等): 主循环独立调用 name_resolver("gz") → 找不到 → 致命错误 ✗
+```
+
+**方案 B（重名）是否可行取决于 preloader 主引导函数是否独立引用 "gz" 分区名。** `detect_gz_bypass.py` 通过双重检查（代码引用计数 + 主引导函数扫描）自动判定。
 
 
 ### halt_on_assert 与 GPT 方案的关系
