@@ -39,9 +39,7 @@
 - 脚本自动检测 LK 中的 bl2_ext GZ 初始化管线和 DTB VCP 节点
 - 部分平台 GPT 方案不可用（如 `halt_on_assert` 被强制置 1 的平台），此时需要 LK 方案
 - 部分平台使用 GPT 方案跳过 GZ 后需处理 VCP 问题：GZ 负责填充 SMMU 保护页表（protpgd）的页表项，跳过 GZ 后页表为空，VCP DMA 映射到 PA=0x0 触发 IOMMU translation fault → 60 秒看门狗超时重启。此外，DEVMPU（Device Memory Protection Unit）的域7（VCP/APU）访问限制由 preloader 设置，正常情况下 VCP 通过 GZ 代理访问受保护内存，跳过 GZ 后 VCP 直接访问被 DEVMPU 拒绝，导致 DEVMPU 违规洪泛（约启动后 33 秒触发 12000+ 次违规 → IRQ 风暴 → HWT 崩溃）。推荐使用 `patch_tee_vcp.py` 三层补丁 ATF（跳过 SMMU 保护 + DEVMPU 重置，保留 VCP 功能），或使用 `detect_lk_gz.py --patch-vcp` + `patch_vendor_boot.py` 禁用 VCP（需同时修补 LK 和 vendor_boot 两个镜像的 DTB）
-- MT6991 等新式平台 GPT 方案不可用：preloader 不再负责加载 GZ，GZ 加载由 bl2_ext 执行。修改 GPT 后设备能进 fastboot，但无法正常启动——bl2_ext 的 `gz_init_main` 会在分区加载失败前执行不可逆的硬件配置（内存重映射、mblock 分配等），cleanup 无法完全逆转这些变更。需使用以下方案之一：
-  - **LK bl2_ext 方案**：`detect_lk_gz.py lk.img --patch-validate --patch-init-fail`（更稳妥）
-  - **直接擦除 gz 分区**：`fastboot erase gz`（更直接，但部分厂商驱动可能依赖 GZ，需进一步修改内核/LK）
+- MT6985/MT6989/MT6991 等新式平台推荐使用 **直接擦除 gz 分区** 方案（`fastboot erase gz`），更直接高效。若擦除后部分厂商驱动依赖 GZ 导致异常，可使用 LK bl2_ext 方案（`detect_lk_gz.py lk.img --patch-validate --patch-init-fail`，实验性）作为备选。
 
 ## 快速开始
 
@@ -58,10 +56,9 @@
 │       ├─ 默认 = 方案 B（三层补丁，推荐）
 │       └─ 备选：--patch-bank-table（方案 A，实验性）
 │
-└─ MT6985 / MT6989 / MT6991 (天玑 v6+) → 两种方案可选：
-    ├─ 方案 1: 直接擦除 gz 分区（更直接，但风险较高）
-    │   └─ fastboot erase gz
-    └─ 方案 2: LK bl2_ext 补丁（更稳妥）
+└─ MT6985 / MT6989 / MT6991 (天玑 v6+) → 推荐直接擦除 gz 分区：
+    ├─ 方案 1: fastboot erase gz（推荐，更直接）
+    └─ 方案 2: LK bl2_ext 补丁（备选，实验性）
         └─ detect_lk_gz.py lk.img --patch-validate --patch-init-fail
 ```
 
@@ -131,10 +128,6 @@ python3 patch_gz_gpt.py pgpt.bin -o my_output.bin
 ```bash
 # 使用底层工具刷写修补后的分区表
 # mtkclient / geekflashtool / unlocktool 等均可
-
-# 或通过 fastboot
-fastboot flash pgpt pgpt_patched.bin
-fastboot flash sgpt pgpt_patched.bin   # 同步刷写到备份 GPT（可选）
 ```
 
 ### 步骤 4：还原
@@ -142,9 +135,6 @@ fastboot flash sgpt pgpt_patched.bin   # 同步刷写到备份 GPT（可选）
 ```bash
 # 使用脚本还原
 python3 patch_gz_gpt.py pgpt.bin --restore
-
-# 或直接刷回备份
-fastboot flash pgpt pgpt_backup.bin
 ```
 
 ---
@@ -190,9 +180,9 @@ python3 patch_tee_vcp.py tee.img --patch-bank-table
 
 ## 天玑 v6+ 处理器（MT6985 / MT6989 / MT6991 等）
 
-v6+ 处理器使用 bl2_ext 加载 GZ（Hafnium S-EL2 架构）。GPT 方案不可用（修改 GPT 后能进 fastboot 但无法正常启动），需使用以下方案之一。
+v6+ 处理器使用 bl2_ext 加载 GZ（Hafnium S-EL2 架构）。推荐使用 **直接擦除 gz 分区** 方案，更直接高效；若擦除后部分厂商驱动依赖 GZ 导致异常，可使用 LK bl2_ext 补丁（实验性）作为备选。
 
-### 方案 1：直接擦除 gz 分区（更直接，但风险较高）
+### 方案 1：直接擦除 gz 分区（推荐）
 
 适用于 **MT6985、MT6989、MT6991** 等 v6+ 处理器。这些处理器由 bl2_ext 加载 GZ，可直接擦除 gz 分区达到禁用 GZ 的目的。
 
@@ -210,9 +200,9 @@ fastboot flash gz gz_backup.img
 > **⚠️ 风险提示**：
 > - 部分厂商驱动可能依赖 GZ 提供的虚拟化服务（如 DRM、安全功能）
 > - 擦除后若设备无法启动或功能异常，需进一步修改内核/LK 以移除 GZ 依赖
-> - 此方法比 GPT 修改更直接，但风险也更高，请确保有救砖能力
+> - 建议先备份原始 gz 分区
 
-### 方案 2：LK bl2_ext 补丁（更稳妥）
+### 方案 2：LK bl2_ext 补丁（备选，实验性）
 
 适用于 GPT 方案不可用的平台。GZ 逻辑在 bl2_ext 段，需直接修补 LK。
 
@@ -1272,9 +1262,7 @@ emi_mpu: violation - domain 7, region 10, master 0x2C06
 - **处理器代际差异**：
   - 天玑 v5 及以下（如 MT6833/MT6893）：GPT LBA 方案通常直接可用，LK 无 GZ 代码不需要 LK 方案
   - 天玑 v6（如 MT6895）：GPT 方案跳过 GZ 后需配合 `patch_tee_vcp.py` 三层补丁 ATF（推荐）或 `--patch-vcp` + `patch_vendor_boot.py` 禁用 VCP，否则 VCP SMMU 保护页表为空导致 IOMMU translation fault → 60 秒看门狗重启，以及 DEVMPU 域7违规洪泛 → 约 33 秒 HWT 崩溃
-  - 天玑 v6+（如 MT6985/MT6989/MT6991）：GPT 方案不可用（修改 GPT 后能进 fastboot 但无法正常启动，bl2_ext 中 GZ 初始化的部分执行导致不可逆硬件配置变更）。可选方案：
-    - **LK bl2_ext 方案**：`detect_lk_gz.py lk.img --patch-validate --patch-init-fail`（更稳妥）
-    - **直接擦除 gz 分区**：`fastboot erase gz`（更直接，但部分厂商驱动可能依赖 GZ，需进一步修改内核/LK）
+  - 天玑 v6+（如 MT6985/MT6989/MT6991）：推荐使用 **直接擦除 gz 分区** 方案（`fastboot erase gz`），更直接高效。若擦除后部分厂商驱动依赖 GZ 导致异常，需进一步修改内核/LK；也可使用 LK bl2_ext 方案（`detect_lk_gz.py lk.img --patch-validate --patch-init-fail`，实验性）作为备选。
   - 或使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 高级用法直接干掉 GenieZone
 - **功能影响**：禁用 GenieZone 后，依赖 GZ 虚拟化服务的功能（如部分 DRM、安全容器等）可能不可用；禁用 VCP 后，硬件视频编解码加速等功能可能不可用或回退到软件实现
 
