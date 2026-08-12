@@ -22,10 +22,10 @@
 |------|------|------|-----------------|
 | **GPT 重名方案** | Preloader | `halt_on_assert` 未强制置 1 且主引导循环无 gz 硬依赖 | 否 |
 | **GPT 无效 LBA 方案** | Preloader | `halt_on_assert` 未被强制置 1 | 否 |
+| **擦除 gz 分区** | gz 分区 | v6+ 处理器（MT6985/MT6989/MT6991） | 否 |
 | **LK bl2_ext 方案** | LK (bl2_ext 段) | bl2_ext 中存在 GZ 初始化管线 | 是 |
 | **ATF VCP 修复** | ATF (tee.img) | ATF 中存在 vcp_smc_vcp_init 函数和 DEVMPU 初始化函数 | 是 |
 | **VCP 禁用** | LK (DTB) + vendor_boot (DTB) | DTB 中存在 vcp-support 节点 | 是 |
-| **擦除 gz 分区** | gz 分区 | v6+ 处理器（MT6985/MT6989/MT6991） | 是 |
 
 - GPT 方案有两个子方案，均不修改代码：
   - **重名方案** (`--rename`)：将 gz 分区改名为 gx，`get_part_info("gz")` 找不到分区 → 无 I/O → 设置 NoGZ。需 preloader 主引导循环不独立依赖 gz 分区名解析（`detect_gz_bypass.py` 自动检测）
@@ -66,9 +66,10 @@
 
 ### 前提条件
 
-所有需要修改 LK/ATF 的方案都需要绕过签名验证：
-- 使用不校验签名的工程版 preloader，或
-- 使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名
+- **擦除 gz 分区**：不需要绕过签名验证，直接通过 fastboot 操作即可
+- **修改 LK/ATF 的方案**（LK bl2_ext、ATF VCP 修复等）：需要绕过签名验证
+  - 使用不校验签名的工程版 preloader，或
+  - 使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名
 
 ---
 
@@ -185,6 +186,8 @@ v6+ 处理器使用 bl2_ext 加载 GZ（Hafnium S-EL2 架构）。推荐使用 *
 ### 方案 1：直接擦除 gz 分区（推荐）
 
 适用于 **MT6985、MT6989、MT6991** 等 v6+ 处理器。这些处理器由 bl2_ext 加载 GZ，可直接擦除 gz 分区达到禁用 GZ 的目的。
+
+> **注意**：此方案通过 fastboot 直接擦除分区，**不需要绕过签名验证**。
 
 ```bash
 # 方法 1: 擦除分区
