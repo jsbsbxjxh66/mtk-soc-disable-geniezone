@@ -1,6 +1,6 @@
 # mtk-soc-disable-geniezone
 
-禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持两种方案：修改 GPT 分区表（preloader 层面）或修补 LK 固件（LK 层面）。LK 方案支持 bl2_ext GZ 初始化管线补丁和 DTB VCP 节点禁用。ATF 方案支持三层补丁：SMMU 保护跳过 + VCP handler 旁路 + DEVMPU 重置（清除 preloader 设置的所有硬件访问限制）。VCP 禁用方案需同时修补 LK DTB 和 vendor_boot DTB（内核设备树）。
+禁用联发科 GenieZone (GZ) 虚拟化管理程序。支持多种方案：修改 GPT 分区表（preloader 层面）、修补 LK 固件（LK 层面）、直接擦除 gz 分区（v6+ 处理器）或 ATF 三层补丁。LK 方案支持 bl2_ext GZ 初始化管线补丁和 DTB VCP 节点禁用。ATF 方案支持三层补丁：SMMU 保护跳过 + VCP handler 旁路 + DEVMPU 重置（清除 preloader 设置的所有硬件访问限制）。VCP 禁用方案需同时修补 LK DTB 和 vendor_boot DTB（内核设备树）。
 
 > **免责声明**
 >
@@ -25,6 +25,7 @@
 | **LK bl2_ext 方案** | LK (bl2_ext 段) | bl2_ext 中存在 GZ 初始化管线 | 是 |
 | **ATF VCP 修复** | ATF (tee.img) | ATF 中存在 vcp_smc_vcp_init 函数和 DEVMPU 初始化函数 | 是 |
 | **VCP 禁用** | LK (DTB) + vendor_boot (DTB) | DTB 中存在 vcp-support 节点 | 是 |
+| **擦除 gz 分区** | gz 分区 | v6+ 处理器（MT6985/MT6989/MT6991） | 是 |
 
 - GPT 方案有两个子方案，均不修改代码：
   - **重名方案** (`--rename`)：将 gz 分区改名为 gx，`get_part_info("gz")` 找不到分区 → 无 I/O → 设置 NoGZ。需 preloader 主引导循环不独立依赖 gz 分区名解析（`detect_gz_bypass.py` 自动检测）
@@ -38,7 +39,9 @@
 - 脚本自动检测 LK 中的 bl2_ext GZ 初始化管线和 DTB VCP 节点
 - 部分平台 GPT 方案不可用（如 `halt_on_assert` 被强制置 1 的平台），此时需要 LK 方案
 - 部分平台使用 GPT 方案跳过 GZ 后需处理 VCP 问题：GZ 负责填充 SMMU 保护页表（protpgd）的页表项，跳过 GZ 后页表为空，VCP DMA 映射到 PA=0x0 触发 IOMMU translation fault → 60 秒看门狗超时重启。此外，DEVMPU（Device Memory Protection Unit）的域7（VCP/APU）访问限制由 preloader 设置，正常情况下 VCP 通过 GZ 代理访问受保护内存，跳过 GZ 后 VCP 直接访问被 DEVMPU 拒绝，导致 DEVMPU 违规洪泛（约启动后 33 秒触发 12000+ 次违规 → IRQ 风暴 → HWT 崩溃）。推荐使用 `patch_tee_vcp.py` 三层补丁 ATF（跳过 SMMU 保护 + DEVMPU 重置，保留 VCP 功能），或使用 `detect_lk_gz.py --patch-vcp` + `patch_vendor_boot.py` 禁用 VCP（需同时修补 LK 和 vendor_boot 两个镜像的 DTB）
-- MT6991 等新式平台 GPT 方案不可用：preloader 不再负责加载 GZ，GZ 加载由 bl2_ext 执行。修改 GPT 后设备能进 fastboot，但无法正常启动——bl2_ext 的 `gz_init_main` 会在分区加载失败前执行不可逆的硬件配置（内存重映射、mblock 分配等），cleanup 无法完全逆转这些变更。需使用 LK bl2_ext 方案
+- MT6991 等新式平台 GPT 方案不可用：preloader 不再负责加载 GZ，GZ 加载由 bl2_ext 执行。修改 GPT 后设备能进 fastboot，但无法正常启动——bl2_ext 的 `gz_init_main` 会在分区加载失败前执行不可逆的硬件配置（内存重映射、mblock 分配等），cleanup 无法完全逆转这些变更。需使用以下方案之一：
+  - **LK bl2_ext 方案**：`detect_lk_gz.py lk.img --patch-validate --patch-init-fail`（更稳妥）
+  - **直接擦除 gz 分区**：`fastboot erase gz`（更直接，但部分厂商驱动可能依赖 GZ，需进一步修改内核/LK）
 
 ## 快速开始
 
@@ -55,8 +58,11 @@
 │       ├─ 默认 = 方案 B（三层补丁，推荐）
 │       └─ 备选：--patch-bank-table（方案 A，实验性）
 │
-└─ MT6991+ (天玑 v6+) → 用 LK bl2_ext 方案
-    └─ detect_lk_gz.py lk.img --patch-validate --patch-init-fail
+└─ MT6985 / MT6989 / MT6991 (天玑 v6+) → 两种方案可选：
+    ├─ 方案 1: 直接擦除 gz 分区（更直接，但风险较高）
+    │   └─ fastboot erase gz
+    └─ 方案 2: LK bl2_ext 补丁（更稳妥）
+        └─ detect_lk_gz.py lk.img --patch-validate --patch-init-fail
 ```
 
 > **提示**：先用 `detect_gz_bypass.py preloader.img` 检测你的设备是否支持 GPT 方案。
@@ -69,9 +75,11 @@
 
 ---
 
-### 方案一：GPT 方案（适用于 MT6833/MT6893 等）
+## 天玑 v5 处理器（MT6833 / MT6893 等）
 
-#### 1. 检测可行性
+v5 处理器的 GZ 初始化由 preloader 负责，LK 无 GZ 代码。使用 GPT 方案即可完全禁用 GZ。
+
+### 步骤 1：检测可行性
 
 先用 `detect_gz_bypass.py` 分析你的设备 preloader，确认 GPT 方案是否适用：
 
@@ -100,15 +108,7 @@ python3 detect_gz_bypass.py preloader.img
   * 以上结果仅供参考, 实际可行性因固件版本和设备而异
 ```
 
-输出示例（GPT 不可用）：
-```
-============================================================
-  GPT 方案不可用 → 需修改 LK 或 bl2_ext 补丁 (v6 设备)
-
-  * 以上结果仅供参考, 实际可行性因固件版本和设备而异
-```
-
-#### 2. 修改分区表
+### 步骤 2：修改分区表
 
 确认 GPT 方案可用后，提取设备的 `pgpt.bin` 并修改：
 
@@ -126,7 +126,7 @@ python3 patch_gz_gpt.py pgpt.bin --rename
 python3 patch_gz_gpt.py pgpt.bin -o my_output.bin
 ```
 
-#### 3. 刷写
+### 步骤 3：刷写
 
 ```bash
 # 使用底层工具刷写修补后的分区表
@@ -137,7 +137,7 @@ fastboot flash pgpt pgpt_patched.bin
 fastboot flash sgpt pgpt_patched.bin   # 同步刷写到备份 GPT（可选）
 ```
 
-#### 4. 还原
+### 步骤 4：还原
 
 ```bash
 # 使用脚本还原
@@ -147,16 +147,139 @@ python3 patch_gz_gpt.py pgpt.bin --restore
 fastboot flash pgpt pgpt_backup.bin
 ```
 
-### 方案二：LK 方案
+---
 
-适用于 GPT 方案不可用的平台，或 GPT 方案需配合 LK 修改的场景。
+## 天玑 v6 处理器（MT6895 等）
 
-**前提条件**：修改 LK 后签名校验不通过，需要以下任一方式绕过签名：
+v6 处理器的 preloader 初始化 GZ，LK 含 VCP，ATF 含 SMMU 保护 + DEVMPU。使用 GPT 方案禁用 GZ 后，需配合 ATF 补丁修复 VCP 崩溃问题。
 
-- 使用不校验签名的 preloader（如工程版 preloader）
-- 使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 绕过签名验证
+### 步骤 1：GPT 方案禁用 GZ
 
-### 方案二：LK bl2_ext 方案（适用于 MT6991+）
+同 v5 处理器的步骤 1-3（检测可行性 → 修改分区表 → 刷写）。
+
+### 步骤 2：ATF VCP 修复
+
+适用于 GPT 方案禁用 GZ 后 VCP 崩溃的平台（如 MT6895）。补丁 tee.img 跳过 SMMU 保护设置。
+
+**前提条件**：需要绕过签名验证（见上方"前提条件"）。
+
+```bash
+# 分析 tee.img（不修改）
+python3 patch_tee_vcp.py tee.img --dry-run
+
+# 应用补丁（默认使用方案 B：三层补丁）
+python3 patch_tee_vcp.py tee.img -o tee_patched.img
+
+# 检测是否已打补丁
+python3 patch_tee_vcp.py tee_patched.img --dry-run
+```
+
+> **注意**：此补丁与 `--patch-protpgd` 互斥，不要同时使用。
+
+#### 方案 A: Bank 表补丁 (`--patch-bank-table`, 实验性)
+
+```bash
+# 步骤 1: LK 补丁（分配 protpgd mblock）
+python3 detect_lk_gz.py lk.img --patch-protpgd
+
+# 步骤 2: ATF bank 表补丁
+python3 patch_tee_vcp.py tee.img --patch-bank-table
+```
+
+---
+
+## 天玑 v6+ 处理器（MT6985 / MT6989 / MT6991 等）
+
+v6+ 处理器使用 bl2_ext 加载 GZ（Hafnium S-EL2 架构）。GPT 方案不可用（修改 GPT 后能进 fastboot 但无法正常启动），需使用以下方案之一。
+
+### 方案 1：直接擦除 gz 分区（更直接，但风险较高）
+
+适用于 **MT6985、MT6989、MT6991** 等 v6+ 处理器。这些处理器由 bl2_ext 加载 GZ，可直接擦除 gz 分区达到禁用 GZ 的目的。
+
+```bash
+# 方法 1: 擦除分区
+fastboot erase gz
+
+# 方法 2: 写入空数据
+fastboot flash gz /dev/zero
+
+# 建议先备份
+fastboot flash gz gz_backup.img
+```
+
+> **⚠️ 风险提示**：
+> - 部分厂商驱动可能依赖 GZ 提供的虚拟化服务（如 DRM、安全功能）
+> - 擦除后若设备无法启动或功能异常，需进一步修改内核/LK 以移除 GZ 依赖
+> - 此方法比 GPT 修改更直接，但风险也更高，请确保有救砖能力
+
+### 方案 2：LK bl2_ext 补丁（更稳妥）
+
+适用于 GPT 方案不可用的平台。GZ 逻辑在 bl2_ext 段，需直接修补 LK。
+
+#### 步骤 1：检测可行性
+
+```bash
+python3 detect_lk_gz.py lk.img
+```
+
+脚本自动检测 LK 类型并显示可用方案。
+
+输出示例（bl2_ext 方案，如 MT6991）：
+```
+============================================================
+  GZ 类型：新式初始化管线 (bl2_ext 段)
+  bl2_ext 代码：0x1B5500  大小：1.3 MB
+  gz_init_main: 0x1CDED0
+  gz_config_validate: 0x1CDEB4
+  错误清理路径：0x1CDF48 (含 gz_mblock_free_all)
+
+  方案 A: gz_config_validate → 返回 0 (跳过 GZ 初始化)
+    python3 detect_lk_gz.py lk.img --patch-validate
+  方案 B: gz_init_main → 强制失败 (触发内存释放清理)
+    python3 detect_lk_gz.py lk.img --patch-init-fail
+  A+B:    python3 detect_lk_gz.py lk.img --patch-validate --patch-init-fail
+```
+
+#### 步骤 2：修补 LK
+
+bl2_ext 方案（`--patch-validate` / `--patch-init-fail`）：
+
+```bash
+# 预览补丁内容（不修改）
+python3 detect_lk_gz.py lk.img --dry-run
+
+# 方案 A: gz_config_validate 返回 0，跳过 GZ 初始化
+python3 detect_lk_gz.py lk.img --patch-validate
+
+# 方案 B: gz_init_main 强制失败，释放 GZ 内存
+python3 detect_lk_gz.py lk.img --patch-init-fail
+
+# A+B 同时应用
+python3 detect_lk_gz.py lk.img --patch-validate --patch-init-fail
+```
+
+VCP 禁用（`--patch-vcp` + `patch_vendor_boot.py`，仅在 ATF 补丁不可用时使用）：
+
+```bash
+# 步骤 1: 禁用 LK DTB 中的 VCP (LK 不加载 VCP 固件)
+python3 detect_lk_gz.py lk.img --patch-vcp
+
+# 步骤 2: 禁用 vendor_boot DTB 中的 VCP (内核 VCP 驱动不 probe)
+python3 patch_vendor_boot.py vendor_boot.img
+```
+
+> **重要**：两步都要做。LK DTB 控制 bootloader 是否加载 VCP 固件，vendor_boot DTB 控制内核 VCP 驱动是否 probe。只改 LK 不改 vendor_boot 会导致内核仍然尝试使用 VCP。
+
+#### 步骤 3：刷写
+
+使用支持跳过签名验证的工具将 `lk_patched.img` 刷入设备。
+
+#### 步骤 4：还原
+
+```bash
+python3 detect_lk_gz.py lk.img --restore
+```
+
 
 #### 1. 检测可行性
 
@@ -211,80 +334,6 @@ python3 patch_vendor_boot.py vendor_boot.img
 ```
 
 > **重要**：两步都要做。LK DTB 控制 bootloader 是否加载 VCP 固件，vendor_boot DTB 控制内核 VCP 驱动是否 probe。只改 LK 不改 vendor_boot 会导致内核仍然尝试使用 VCP。
-
----
-
-### 方案二：ATF VCP 修复（配合 GPT 方案使用）
-
-适用于 GPT 方案禁用 GZ 后 VCP 崩溃的平台（如 MT6895）。补丁 tee.img 跳过 SMMU 保护设置。
-
-**前提条件**：需要绕过签名验证（见上方"前提条件"）。
-
-```bash
-# 分析 tee.img（不修改）
-python3 patch_tee_vcp.py tee.img --dry-run
-
-# 应用补丁（默认使用方案 B：三层补丁）
-python3 patch_tee_vcp.py tee.img -o tee_patched.img
-
-# 检测是否已打补丁
-python3 patch_tee_vcp.py tee_patched.img --dry-run
-```
-
-> **注意**：此补丁与 `--patch-protpgd` 互斥，不要同时使用。使用此补丁后 protpgd mblock 不再需要。
-
-#### 方案 A: Bank 表补丁 (`--patch-bank-table`, 实验性)
-
-```bash
-# 步骤 1: LK 补丁（分配 protpgd mblock）
-python3 detect_lk_gz.py lk.img --patch-protpgd
-
-# 步骤 2: ATF bank 表补丁
-python3 patch_tee_vcp.py tee.img --patch-bank-table
-
-# 分析（不修改）
-python3 patch_tee_vcp.py tee.img --patch-bank-table --dry-run
-
-# 还原
-python3 patch_tee_vcp.py tee.img --patch-bank-table --restore
-```
-
-#### 3. 刷写
-
-使用支持跳过签名验证的工具将 `lk_patched.img` 刷入设备。
-
-#### 4. 还原
-
-```bash
-python3 detect_lk_gz.py lk.img --restore
-```
-
----
-
-### 方案三：VCP 禁用（备用方案）
-
-完全禁用 VCP 需要修改两个镜像中的 DTB，仅在 ATF 补丁不可用时使用。
-
-#### 步骤 1: 禁用 LK DTB 中的 VCP (LK 不加载 VCP 固件)
-
-```bash
-python3 detect_lk_gz.py lk.img --patch-vcp
-```
-
-#### 步骤 2: 禁用 vendor_boot DTB 中的 VCP (内核 VCP 驱动不 probe)
-
-```bash
-python3 patch_vendor_boot.py vendor_boot.img
-```
-
-> **重要**：两步都要做。LK DTB 控制 bootloader 是否加载 VCP 固件，vendor_boot DTB 控制内核 VCP 驱动是否 probe。只改 LK 不改 vendor_boot 会导致内核仍然尝试使用 VCP。
-
-#### 步骤 3: 刷写
-
-```bash
-fastboot flash lk lk_patched.img
-fastboot flash vendor_boot vendor_boot_patched.img
-```
 
 ---
 
@@ -1188,6 +1237,8 @@ emi_mpu: violation - domain 7, region 10, master 0x2C06
 | Realme GT Neo 闪速版 | MT6893 | Android 13 | ARM32 Thumb PIC | ARM32 | 未测试 | **可用** | 不适用（LK 无 GZ 代码） | ✅ |
 | — | MT6895 | — | ARM32 Thumb | AArch64 | 未测试 | 未测试 | 未测试 | — |
 | — | MT6991 | — | AArch64 | AArch64 | — | 未测试 | 未测试 | — |
+| — | MT6985 | — | AArch64 | AArch64 | — | 未测试 | 未测试 | — |
+| — | MT6989 | — | AArch64 | AArch64 | — | 未测试 | 未测试 | — |
 
 ### 其他
 
@@ -1209,7 +1260,9 @@ emi_mpu: violation - domain 7, region 10, master 0x2C06
 - **处理器代际差异**：
   - 天玑 v5 及以下（如 MT6833/MT6893）：GPT LBA 方案通常直接可用，LK 无 GZ 代码不需要 LK 方案
   - 天玑 v6（如 MT6895）：GPT 方案跳过 GZ 后需配合 `patch_tee_vcp.py` 三层补丁 ATF（推荐）或 `--patch-vcp` + `patch_vendor_boot.py` 禁用 VCP，否则 VCP SMMU 保护页表为空导致 IOMMU translation fault → 60 秒看门狗重启，以及 DEVMPU 域7违规洪泛 → 约 33 秒 HWT 崩溃
-  - 天玑 v6+（如 MT6991）：GPT 方案不可用（修改 GPT 后能进 fastboot 但无法正常启动，bl2_ext 中 GZ 初始化的部分执行导致不可逆硬件配置变更），需使用 bl2_ext 方案（`--patch-validate` / `--patch-init-fail`）
+  - 天玑 v6+（如 MT6985/MT6989/MT6991）：GPT 方案不可用（修改 GPT 后能进 fastboot 但无法正常启动，bl2_ext 中 GZ 初始化的部分执行导致不可逆硬件配置变更）。可选方案：
+    - **LK bl2_ext 方案**：`detect_lk_gz.py lk.img --patch-validate --patch-init-fail`（更稳妥）
+    - **直接擦除 gz 分区**：`fastboot erase gz`（更直接，但部分厂商驱动可能依赖 GZ，需进一步修改内核/LK）
   - 或使用 [pwnage24mtk](https://github.com/jsbsbxjxh66/pwnage24mtk) 高级用法直接干掉 GenieZone
 - **功能影响**：禁用 GenieZone 后，依赖 GZ 虚拟化服务的功能（如部分 DRM、安全容器等）可能不可用；禁用 VCP 后，硬件视频编解码加速等功能可能不可用或回退到软件实现
 
